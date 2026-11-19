@@ -207,12 +207,3 @@ TAVILY_API_KEY=your-tavily-api-key
   ```
 
 ---
-
-## 来源与使用说明
-
-本项目基于 DeepLearning.AI《Agentic AI 实战》课程的公开 lab 代码
-（[https-deeplearning-ai/agentic-ai-public](https://github.com/https-deeplearning-ai/agentic-ai-public)）整理，
-用于个人学习与实验。上游仓库未提供 LICENSE，代码与课程内容的版权归原作者/课程方所有，
-请勿用于商业分发。
-
-仓库只提交 `.env.example`（占位值）；真实的 `.env` 已被 `.gitignore` 忽略。
