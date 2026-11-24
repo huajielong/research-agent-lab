@@ -165,7 +165,7 @@ def writer_agent(
     model: str = DEFAULT_MODEL,
     min_words_total: int = 2400,
     min_words_per_section: int = 400,
-    max_tokens: int = 15000,
+    max_tokens: int = int(os.getenv("OPENAI_MAX_TOKENS", "32000")),
     retries: int = 1,
 ):
     print("==================================")
@@ -233,14 +233,15 @@ INTERNAL CHECKLIST (DO NOT INCLUDE IN OUTPUT):
         {"role": "user", "content": prompt},
     ]
 
-    def _call(messages_):
+    def _call(messages_, budget_=None):
         resp = client.chat.completions.create(
             model=model,
             messages=messages_,
             temperature=0,
-            max_tokens=max_tokens,
+            max_tokens=budget_ or max_tokens,
         )
-        return resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        return choice.message.content or "", getattr(choice, "finish_reason", None)
 
     def _word_count(md_text: str) -> int:
         import re
@@ -248,7 +249,41 @@ INTERNAL CHECKLIST (DO NOT INCLUDE IN OUTPUT):
         words = re.findall(r"\b\w+\b", md_text)
         return len(words)
 
-    content = _call(messages)
+    content, finish = _call(messages)
+
+    # 推理模型的隐藏推理 token 也计入 max_tokens，达到上限时正文会被截断
+    # （finish_reason == "length"）：
+    # - 已有可见输出：要求模型从截断处续写；
+    # - 可见输出为空（token 全被隐藏推理占用）：加倍 max_tokens 重试。
+    budget = max_tokens
+    continuation = 0
+    msgs = list(messages)
+    piece = content
+    while finish in ("length", "max_tokens") and continuation < 6:
+        continuation += 1
+        if piece.strip():
+            print(f"⚠️ 输出达到长度上限被截断，自动续写第 {continuation} 段…")
+            msgs.append({"role": "assistant", "content": piece})
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "你的上一条输出因长度限制被截断了。请从截断处紧接续写，"
+                        "不要重复已经写过的任何内容，不要写任何开场白或解释，"
+                        "保持原有的 Markdown 结构，直到报告完整结束。"
+                    ),
+                }
+            )
+            more, finish = _call(msgs, budget)
+            if not more.strip():
+                break
+            content += more
+            piece = more
+        else:
+            budget = min(budget * 2, 64000)
+            print(f"⚠️ 输出被推理内容占满，提升 max_tokens 到 {budget} 重试…")
+            piece, finish = _call(msgs, budget)
+            content = piece
 
     print("✅ 输出：\n", content)
     return content, messages

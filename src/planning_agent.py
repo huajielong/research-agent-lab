@@ -123,9 +123,11 @@ Topic: "{topic}"
                     if "arXiv" not in s or "For each collected item" in s
                 ]
             )
-        # 确保包含最后一步的要求
-        if final_required not in steps_list:
-            steps_list.append(final_required)
+        # 确保「最终报告」始终是最后一步（main.py 会把最后一步的输出当报告）
+        steps_list = [s for s in steps_list if s != final_required]
+        if len(steps_list) >= 7:
+            steps_list = steps_list[:6]
+        steps_list.append(final_required)
         # 最多保留 7 步
         return steps_list[:7]
 

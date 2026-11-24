@@ -93,7 +93,7 @@ docker/entrypoint.sh    容器内 Postgres 初始化 + uvicorn 启动
 - 第 1 步必须是 Tavily 广搜；
 - 第 2 步必须是基于第 1 步候选做 arXiv 匹配；
 - 最后一步必须是 writer 生成带引用和 References 的 Markdown 报告；
-- 缺失就注入，超出 7 步截断。
+- 缺失就注入；最终报告步骤始终移到末尾，并保证总步数不超过 7（必要时先删掉原第 7 步）。
 
 改规划行为要同时改提示词和 `_ensure_contract`，只改一处会被契约覆盖。
 
@@ -117,6 +117,9 @@ docker/entrypoint.sh    容器内 Postgres 初始化 + uvicorn 启动
   `gpt-4.1-mini`；规划器共用同一默认。要换模型改 `.env` 或函数参数。
 - OpenAI 兼容端点不一定支持 `o4-mini` / `gpt-4.1-mini`：本机端点只支持
   `deepseek-flash` / `deepseek-v4-pro`，必须靠 `OPENAI_MODEL` 覆盖。
+- `writer_agent` 的 `max_tokens` 默认 32000（`OPENAI_MAX_TOKENS` 可覆盖）。推理模型的
+  隐藏推理 token 也计入该额度；`finish_reason == "length"` 时会自动从截断处续写，
+  正文为空（token 全被推理占用）时加倍额度重试，避免最终报告被截断。
 - `research_agent` 传 `tools=[arxiv, tavily, wikipedia]`、`tool_choice="auto"`、`max_turns=5`；
   从 `intermediate_responses` / `intermediate_messages` 提取工具调用，附加成 HTML 列表。
 - `tavily_search_tool` 需要 `TAVILY_API_KEY`，支持 `DLAI_TAVILY_BASE_URL` 覆盖端点。
@@ -232,8 +235,8 @@ docker run --env-file .env -p 8000:8000 -p 5432:5432 --name fpsvc fastapi-postgr
 
 ## 关键坑
 
-- **`main.py` 启动时执行 `Base.metadata.drop_all`**：每次启动都会清空 `tasks` 表。
-  需要保留任务时先去掉这段（README 建议用 `RESET_DB_ON_STARTUP` 环境变量保护）。
+- **`main.py` 只在 `RESET_DB_ON_STARTUP=1` 时执行 `Base.metadata.drop_all`**：
+  默认重启保留 `tasks` 表；要清空历史任务就显式设置该环境变量。
 - **`DATABASE_URL` 必填且检查顺序有 bug**：代码先 `DATABASE_URL.startswith(...)` 再判空，
   未设置时会报 `AttributeError` 而不是预期的 `RuntimeError`。
 - **`task_progress` 只在进程内存**：重启即丢；uvicorn 保持单 worker，多 worker 轮询会打空。

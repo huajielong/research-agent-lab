@@ -74,6 +74,10 @@
 * `POSTGRES_USER`（默认 `app`）
 * `POSTGRES_PASSWORD`（默认 `local`）
 * `POSTGRES_DB`（默认 `appdb`）
+* `OPENAI_MODEL`（默认 `gpt-4.1-mini`，代码会自动补 `openai:` 前缀）
+* `OPENAI_BASE_URL`（OpenAI 兼容端点，例如 DeepSeek）
+* `OPENAI_MAX_TOKENS`（writer 单次输出上限，默认 `32000`；被截断会自动续写）
+* `RESET_DB_ON_STARTUP=1`（启动时清空 `tasks` 表；默认保留历史任务）
 
 ---
 
@@ -168,13 +172,16 @@ curl http://localhost:8000/task_status/<TASK_ID>
 
 **重启后数据表消失**
 
-* 你的 `main.py` 在启动时调用了 `Base.metadata.drop_all(...)`。
-  请将其注释掉，或用环境变量开关加以保护：
+* 现在默认**不会**清空：`main.py` 只在 `RESET_DB_ON_STARTUP=1` 时执行
+  `Base.metadata.drop_all(...)`。需要每次启动重建 `tasks` 表时显式设置该变量。
+* 旧版本的行为是每次启动都清空；升级后历史任务会保留。
 
-  ```python
-  if os.getenv("RESET_DB_ON_STARTUP") == "1":
-      Base.metadata.drop_all(bind=engine)
-  ```
+**最终报告被截断**
+
+* 推理模型（如 DeepSeek）的隐藏推理 token 也计入 `max_tokens`，正文写到上限就会被切断。
+  `writer_agent` 现在默认 `max_tokens=32000`，并在 `finish_reason == "length"` 时
+  自动从截断处续写；若正文为空（额度全被推理占用）会自动加倍重试（上限 64000）。
+* 仍觉得不够可调大 `OPENAI_MAX_TOKENS`。
 
 **Tavily / arXiv / Wikipedia 报错**
 

@@ -49,10 +49,11 @@ class Task(Base):
     result = Column(Text)
 
 
-try:
-    Base.metadata.drop_all(bind=engine)
-except Exception as e:
-    print(f"\u274c 数据库创建失败：{e}")
+if os.getenv("RESET_DB_ON_STARTUP") == "1":
+    try:
+        Base.metadata.drop_all(bind=engine)
+    except Exception as e:
+        print(f"\u274c 数据库清理失败：{e}")
 
 try:
     Base.metadata.create_all(bind=engine)
