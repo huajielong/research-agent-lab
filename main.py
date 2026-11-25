@@ -73,6 +73,7 @@ AUTH_FAILURE_LIMIT = _env_int("AUTH_FAILURE_LIMIT", 5)
 POLL_RATE_LIMIT_PER_MINUTE = _env_int("POLL_RATE_LIMIT_PER_MINUTE", 120)
 MAX_ACTIVE_TASKS = _env_int("MAX_ACTIVE_TASKS", 10)
 MAX_CONCURRENT_TASKS = _env_int("MAX_CONCURRENT_TASKS", 2)
+MAX_PROGRESS_ENTRIES = _env_int("MAX_PROGRESS_ENTRIES", 200)
 # 逗号分隔；留空表示只允许同源（同源请求本来就不需要 CORS）。
 CORS_ALLOW_ORIGINS = [
     origin.strip()
@@ -284,6 +285,7 @@ def generate_report(req: PromptRequest, request: Request):
 
         with task_progress_lock:
             task_progress[task_id] = {"steps": []}
+        _prune_task_progress()
 
         initial_plan_steps = planner_agent(req.prompt)
 
@@ -314,6 +316,7 @@ def generate_report(req: PromptRequest, request: Request):
         with active_tasks_lock:
             active_tasks = max(0, active_tasks - 1)
         _mark_task_failed(task_id)
+        _mark_progress_finished(task_id)
         print(f"任务 {task_id} 启动失败：{exc}")
         raise HTTPException(status_code=502, detail="任务启动失败，请稍后重试") from exc
 
@@ -330,6 +333,24 @@ def _mark_task_failed(task_id: str) -> None:
         print(f"任务 {task_id} 状态更新失败：{exc}")
     finally:
         db.close()
+
+
+def _mark_progress_finished(task_id: str) -> None:
+    with task_progress_lock:
+        data = task_progress.get(task_id)
+        if data is not None:
+            data["finished"] = True
+
+
+def _prune_task_progress() -> None:
+    """完成后保留一段时间供 UI 轮询，但整体数量有上限，避免内存无界增长。"""
+    with task_progress_lock:
+        if len(task_progress) <= MAX_PROGRESS_ENTRIES:
+            return
+        overflow = len(task_progress) - MAX_PROGRESS_ENTRIES
+        finished = [tid for tid, data in task_progress.items() if data.get("finished")]
+        for tid in finished[:overflow]:
+            task_progress.pop(tid, None)
 
 
 @app.get("/task_progress/{task_id}")
@@ -460,6 +481,7 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
                 db.commit()
         finally:
             db.close()
+        _mark_progress_finished(task_id)
 
     except Exception as e:
         print(f"任务 {task_id} 的工作流出错：{e}")
@@ -477,3 +499,4 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
                 )
 
         _mark_task_failed(task_id)
+        _mark_progress_finished(task_id)

@@ -95,6 +95,7 @@
   `X-Forwarded-For` 时启用；直接暴露公网时保持关闭。
 * `MAX_ACTIVE_TASKS`（默认 `10`，运行中 + 排队任务上限）
 * `MAX_CONCURRENT_TASKS`（默认 `2`，同时调用 LLM 的任务数）
+* `MAX_PROGRESS_ENTRIES`（默认 `200`，内存中保留的任务进度条数上限）
 * `CORS_ALLOW_ORIGINS`（逗号分隔；留空 = 只允许同源）
 
 模型相关：

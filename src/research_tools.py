@@ -139,13 +139,52 @@ def _is_public_http_url(url: str) -> bool:
     return True
 
 
+def _connected_peer_ip(response) -> str | None:
+    """取实际连接的对端 IP；不同 urllib3 版本暴露位置不同，取不到就返回 None。"""
+    raw = getattr(response, "raw", None)
+    conn = getattr(raw, "_connection", None)
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        fp = getattr(raw, "_fp", None)
+        fp = getattr(fp, "fp", None)
+        raw_sock = getattr(fp, "raw", None)
+        sock = getattr(raw_sock, "_sock", None)
+    if sock is None:
+        return None
+    try:
+        return sock.getpeername()[0]
+    except (OSError, AttributeError):
+        return None
+
+
+def _uses_proxy(url: str) -> bool:
+    """经过代理时 peer 是代理地址，无法用它判断源站；域名白名单仍是主防线。"""
+    if session.proxies:
+        return True
+    try:
+        return bool(requests.utils.get_environ_proxies(url))
+    except Exception:
+        return False
+
+
 def _get_public_response(pdf_url: str, timeout: int) -> requests.Response:
-    """手动跟随重定向，每一跳都校验目标地址。"""
+    """手动跟随重定向，每一跳都校验目标地址和实际连接的对端 IP。"""
     url = pdf_url
     for _ in range(5):
         if not _is_allowed_pdf_url(url):
             raise ValueError("PDF URL is not an allowed arXiv public http(s) URL")
         response = session.get(url, timeout=timeout, allow_redirects=False, stream=True)
+        if not _uses_proxy(url):
+            peer = _connected_peer_ip(response)
+            if peer is not None:
+                try:
+                    peer_ip = ipaddress.ip_address(peer.split("%", 1)[0])
+                except ValueError:
+                    response.close()
+                    raise ValueError("PDF connected peer is not a valid IP")
+                if not peer_ip.is_global:
+                    response.close()
+                    raise ValueError("PDF connected peer is not a public IP")
         if response.is_redirect:
             location = response.headers.get("location")
             response.close()
