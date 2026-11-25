@@ -3,6 +3,8 @@
 const $ = id => document.getElementById(id);
 const state = { tasks: [], id: null, prompt: '', steps: [], selected: -1, status: '', report: '', timer: null, generation: 0, submitting: false, tab: 'process', detailKey: '' };
 const selectedTaskIds = new Set();
+let accessKey = '';
+try { accessKey = sessionStorage.getItem('research-access-key') || ''; } catch {}
 const labels = { pending: '等待执行', running: '正在执行', done: '已完成', error: '执行中断' };
 const escapeText = text => String(text ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function safeMarkdown(text) {
@@ -14,8 +16,17 @@ function richText(element, text) {
   element.querySelectorAll('a').forEach(a => { a.target = '_blank'; a.rel = 'noopener noreferrer'; });
 }
 async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, signal: AbortSignal.timeout(20000) });
+  const headers = new Headers(options.headers);
+  if (accessKey) headers.set('X-API-Key', accessKey);
+  const response = await fetch(path, { ...options, headers, signal: AbortSignal.timeout(20000) });
   if (!response.ok) {
+    if (response.status === 401) {
+      accessKey = '';
+      try { sessionStorage.removeItem('research-access-key'); } catch {}
+      state.generation++; stopPolling(); state.tasks = []; renderHistory();
+      $('taskPanel').hidden = true; $('reportContent').replaceChildren();
+      showAccessDialog();
+    }
     let body; try { body = await response.json(); } catch {}
     const error = new Error(typeof body?.detail === 'string' ? body.detail : `请求失败（${response.status}），请稍后重试。`);
     error.status = response.status;
@@ -197,7 +208,7 @@ function renderTask() {
     state.selected = state.steps.findIndex(s => s.status === 'running');
     if (state.selected < 0) state.selected = 0;
   }
-  $('timeline').innerHTML = state.steps.length ? state.steps.map((s, i) => `<button class="step ${escapeText(s.status)} ${state.selected === i ? 'selected' : ''}" data-step="${i}" title="${escapeText(s.title)}" aria-pressed="${state.selected === i}"><span class="step-indicator">${s.status === 'done' ? '✓' : s.status === 'error' ? '!' : ''}</span><span class="step-text"><span class="step-name">${stepName(s.title, i)}</span><span class="step-state">${labels[s.status] || ''}</span></span></button>`).join('') : '<p class="muted sidebar-empty">计划生成后将自动开始研究。</p>';
+  $('timeline').innerHTML = state.steps.length ? state.steps.map((s, i) => `<button class="step ${escapeText(s.status)} ${state.selected === i ? 'selected' : ''}" data-step="${i}" title="${escapeText(s.title)}" aria-pressed="${state.selected === i}"><span class="step-indicator">${s.status === 'done' ? '✓' : s.status === 'error' ? '!' : ''}</span><span class="step-text"><span class="step-name">${escapeText(stepName(s.title, i))}</span><span class="step-state">${labels[s.status] || ''}</span></span></button>`).join('') : '<p class="muted sidebar-empty">计划生成后将自动开始研究。</p>';
   $('reportTab').disabled = !state.report;
   renderDetails();
 }
@@ -321,7 +332,38 @@ document.addEventListener('keydown', event => { if (event.key === 'Escape') clos
 $('downloadMd').addEventListener('click', () => download('md'));
 $('downloadHtml').addEventListener('click', () => download('html'));
 $('copyReport').addEventListener('click', async () => { try { await navigator.clipboard.writeText(state.report); $('copyReport').textContent = '已复制'; setTimeout(() => $('copyReport').textContent = '复制全文', 2000); } catch { notice('浏览器未允许复制，请下载报告后复制。'); } });
-api('/config').then(config => $('modelName').textContent = config.model).catch(() => $('modelName').textContent = '研究模型');
-loadHistory();
-const initialTask = new URLSearchParams(location.search).get('task');
-if (initialTask) openTask(initialTask);
+function showAccessDialog() {
+  $('accessCancel').hidden = !accessKey;
+  if (!$('accessDialog').open) $('accessDialog').showModal();
+  $('accessKeyInput').focus();
+}
+async function loadWorkspace() {
+  try {
+    const config = await api('/config');
+    $('modelName').textContent = config.model;
+    if (config.max_prompt_chars) $('promptInput').maxLength = config.max_prompt_chars;
+    await loadHistory();
+    const initialTask = new URLSearchParams(location.search).get('task');
+    if (initialTask) openTask(initialTask);
+  } catch (error) { notice(error.message); }
+}
+$('accessSettings').addEventListener('click', showAccessDialog);
+$('accessDialog').addEventListener('cancel', event => { if (!accessKey) event.preventDefault(); });
+$('accessCancel').addEventListener('click', () => { $('accessKeyInput').value = ''; $('accessDialog').close(); });
+$('accessForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  accessKey = $('accessKeyInput').value.trim();
+  $('accessError').hidden = true; $('accessSubmit').disabled = true;
+  try {
+    await api('/config');
+    try { sessionStorage.setItem('research-access-key', accessKey); } catch {}
+    $('accessKeyInput').value = ''; $('accessDialog').close(); notice();
+    await loadWorkspace();
+  } catch (error) {
+    $('accessError').textContent = error.message; $('accessError').hidden = false;
+  } finally { $('accessSubmit').disabled = false; }
+});
+api('/api').then(config => {
+  $('accessSettings').hidden = !config.auth_required;
+  if (config.auth_required && !accessKey) showAccessDialog(); else loadWorkspace();
+}).catch(error => notice('无法连接工作台：' + error.message));

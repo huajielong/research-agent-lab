@@ -10,7 +10,7 @@ configure_console()
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, field_validator
@@ -19,6 +19,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
+from src.security import (authorize, ALLOW_ANONYMOUS, MAX_PROMPT_CHARS,
+                          MAX_ACTIVE_TASKS, task_semaphore, sanitize_html, safe_result)
 # Load model configuration before importing the clients and their default arguments.
 from src.planning_agent import planner_agent, executor_agent_step
 
@@ -56,10 +58,25 @@ app = FastAPI(title='Research 工作台')
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 templates = Jinja2Templates(directory=ROOT / 'templates')
 task_progress = {}
+task_lock = threading.RLock()
+
+
+@app.middleware('http')
+async def protect_workspace(request, call_next):
+    if request.url.path not in ('/', '/api') and not request.url.path.startswith('/static/'):
+        try:
+            authorize(request)
+        except HTTPException as exc:
+            return JSONResponse({'detail': exc.detail}, status_code=exc.status_code,
+                                headers={'Cache-Control': 'no-store'})
+    response = await call_next(request)
+    if not request.url.path.startswith('/static/'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 class PromptRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=12000)
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
 
     @field_validator('prompt')
     @classmethod
@@ -76,12 +93,13 @@ def read_index(request: Request):
 
 @app.get('/api')
 def health_check():
-    return {'status': 'ok'}
+    return {'status': 'ok', 'auth_required': not ALLOW_ANONYMOUS}
 
 
 @app.get('/config')
 def config():
-    return {'model': os.getenv('OPENAI_MODEL') or 'OpenAI · o4-mini / gpt-4.1-mini'}
+    return {'model': os.getenv('OPENAI_MODEL') or 'OpenAI · o4-mini / gpt-4.1-mini',
+            'max_prompt_chars': MAX_PROMPT_CHARS}
 
 
 @app.get('/tasks')
@@ -124,9 +142,9 @@ def delete_finished_tasks(task_ids):
 
 
 def save_progress(task_id, status='running', report=None, error=None):
-    result = {'history': task_progress[task_id]['steps']}
+    result = {'history': safe_result(task_progress[task_id]['steps'])}
     if report is not None:
-        result['html_report'] = report
+        result['html_report'] = sanitize_html(report)
     if error:
         result['error'] = error
     with SessionLocal() as db:
@@ -139,6 +157,15 @@ def save_progress(task_id, status='running', report=None, error=None):
 
 @app.post('/generate_report')
 def generate_report(req: PromptRequest):
+    # Serialize admission and insertion; queued tasks count towards the cap.
+    with task_lock:
+        with SessionLocal() as db:
+            if db.query(Task).filter(Task.status == 'running').count() >= MAX_ACTIVE_TASKS:
+                raise HTTPException(429, '当前任务过多，请稍后重试')
+        return start_report(req)
+
+
+def start_report(req):
     task_id = str(uuid.uuid4())
     with SessionLocal() as db:
         db.add(Task(id=task_id, prompt=req.prompt, status='running'))
@@ -149,6 +176,11 @@ def generate_report(req: PromptRequest):
 
 
 def plan_and_run(task_id, prompt):
+    with task_semaphore:
+        _plan_and_run(task_id, prompt)
+
+
+def _plan_and_run(task_id, prompt):
     try:
         plan = planner_agent(prompt)
         if not plan:
@@ -166,13 +198,13 @@ def plan_and_run(task_id, prompt):
 @app.get('/task_progress/{task_id}')
 def get_task_progress(task_id: str):
     if task_id in task_progress:
-        return task_progress[task_id]
+        return safe_result(task_progress[task_id])
     with SessionLocal() as db:
         task = db.get(Task, task_id)
         if not task:
             raise HTTPException(status_code=404, detail='任务不存在')
         result = json.loads(task.result) if task.result else {}
-        return {'steps': result.get('history', [])}
+        return safe_result({'steps': result.get('history', [])})
 
 
 @app.get('/task_status/{task_id}')
@@ -182,7 +214,7 @@ def get_task_status(task_id: str):
         if not task:
             raise HTTPException(status_code=404, detail='任务不存在')
         return {'status': task.status, 'prompt': task.prompt,
-                'result': json.loads(task.result) if task.result else None}
+                'result': safe_result(json.loads(task.result)) if task.result else None}
 
 
 def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
@@ -198,7 +230,7 @@ def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
                 raise RuntimeError(output)
             history.append([title, description, output])
             step.update(status='done', description='已完成：' + title)
-            step['substeps'].append({'title': '调用 ' + agent, 'content': output})
+            step['substeps'].append({'title': '调用 ' + agent, 'content': sanitize_html(output)})
             save_progress(task_id)
         save_progress(task_id, status='done', report=history[-1][-1] if history else '未生成报告。')
     except Exception as exc:

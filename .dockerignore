@@ -15,6 +15,12 @@ venv/
 data/
 tasks.db
 tasks.db.*
+*.db
+*.db-*
+*.db.*
+*.sqlite*
+.screenshots/
+docs/design/*.jpg
 *.log
 
 # Agent instructions and docs are not needed at runtime.
