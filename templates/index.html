@@ -215,6 +215,46 @@ function submitPrompt() {
   .catch(err => showError(err.message || '请求失败'));
 }
 
+function makeSubstepElement(index, j, sub) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'substep';
+
+  const header = document.createElement('div');
+  header.className = 'substep-header';
+  header.setAttribute('data-bs-toggle', 'collapse');
+  header.setAttribute('data-bs-target', `#substep-${index}-${j}`);
+  header.setAttribute('aria-expanded', 'false');
+  header.setAttribute('aria-controls', `substep-${index}-${j}`);
+  header.textContent = `➕ ${sub.title ?? ''}`;
+
+  const collapse = document.createElement('div');
+  collapse.id = `substep-${index}-${j}`;
+  collapse.className = 'collapse';
+
+  const content = document.createElement('div');
+  content.className = 'bg-light p-2 rounded';
+  content.style.whiteSpace = 'pre-wrap';
+  // 只有经过 marked + DOMPurify 的内容才允许进 innerHTML。
+  content.innerHTML = renderMarkdown(sub.content);
+
+  collapse.appendChild(content);
+  wrapper.append(header, collapse);
+  return wrapper;
+}
+
+function buildCardBody(step, index) {
+  const body = document.createElement('div');
+  body.className = 'card-body';
+
+  const description = document.createElement('p');
+  description.textContent = step.description ?? '';
+  body.appendChild(description);
+
+  const substeps = Array.isArray(step.substeps) ? step.substeps : [];
+  substeps.forEach((sub, j) => body.appendChild(makeSubstepElement(index, j, sub)));
+  return body;
+}
+
 function fetchProgress() {
   if (!currentTaskId) return;
 
@@ -240,56 +280,45 @@ function fetchProgress() {
 
         renderedSteps.set(index, stepKey);
 
-        const icon = step.status === 'done' ? '✅' :
-                     step.status === 'running' ? '<span class="spinner-border spinner-border-sm text-warning"></span>' :
-                     step.status === 'error' ? '❌' : '🕓';
-
         const rowId = `step-row-${index}`;
         let row = document.getElementById(rowId);
         if (!row) {
           row = document.createElement('div');
           row.id = rowId;
-          row.className = `step-header ${getStatusClass(step.status)}`;
-          row.innerHTML = `${icon} ${step.title}`;
           document.getElementById('stepStatusList').appendChild(row);
-        } else {
-          row.className = `step-header ${getStatusClass(step.status)}`;
-          row.innerHTML = `${icon} ${step.title}`;
         }
+        row.className = `step-header ${getStatusClass(step.status)}`;
+
+        const iconNode = document.createElement('span');
+        if (step.status === 'running') {
+          iconNode.className = 'spinner-border spinner-border-sm text-warning';
+        } else {
+          iconNode.textContent = step.status === 'done' ? '✅' :
+                                 step.status === 'error' ? '❌' : '🕓';
+        }
+        row.replaceChildren(iconNode, document.createTextNode(` ${step.title ?? ''}`));
 
         const cardId = `step-card-${index}`;
         let card = document.getElementById(cardId);
-        const substepsHTML = substeps.map((sub, j) => `
-          <div class="substep">
-            <div class="substep-header" data-bs-toggle="collapse" data-bs-target="#substep-${index}-${j}" aria-expanded="false" aria-controls="substep-${index}-${j}">
-              ➕ ${sub.title}
-            </div>
-            <div id="substep-${index}-${j}" class="collapse">
-              <div class="bg-light p-2 rounded" style="white-space:pre-wrap;">${renderMarkdown(sub.content)}</div>
-            </div>
-          </div>
-        `).join('');
-
         if (!card) {
           card = document.createElement('div');
           card.id = cardId;
-          card.className = `card mb-3 ${getStepClass(step.status)}`;
-          card.innerHTML = `
-            <div class="card-header">${step.title} — ${escapeHtml(statusLabel(step.status))}</div>
-            <div class="card-body">
-              <p>${step.description}</p>
-              ${substepsHTML}
-            </div>
-          `;
           document.getElementById('stepDetails').appendChild(card);
-        } else {
-          card.className = `card mb-3 ${getStepClass(step.status)}`;
-          card.querySelector('.card-header').innerHTML = `${step.title} — ${escapeHtml(statusLabel(step.status))}`;
-          card.querySelector('.card-body').innerHTML = `
-            <p>${step.description}</p>
-            ${substepsHTML}
-          `;
         }
+        card.className = `card mb-3 ${getStepClass(step.status)}`;
+
+        let cardHeader = card.querySelector('.card-header');
+        if (!cardHeader) {
+          cardHeader = document.createElement('div');
+          cardHeader.className = 'card-header';
+          card.appendChild(cardHeader);
+        }
+        cardHeader.textContent = `${step.title ?? ''} — ${statusLabel(step.status)}`;
+
+        const oldBody = card.querySelector('.card-body');
+        const newBody = buildCardBody(step, index);
+        if (oldBody) oldBody.replaceWith(newBody);
+        else card.appendChild(newBody);
       });
 
       fetchTaskStatus();

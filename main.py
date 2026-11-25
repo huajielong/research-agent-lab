@@ -60,6 +60,7 @@ if not APP_API_KEY and not ALLOW_ANONYMOUS:
 MAX_PROMPT_CHARS = _env_int("MAX_PROMPT_CHARS", 4000)
 RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 5)
 MAX_RATE_BUCKETS = _env_int("MAX_RATE_BUCKETS", 10_000)
+AUTH_FAILURE_LIMIT = _env_int("AUTH_FAILURE_LIMIT", 5)
 MAX_ACTIVE_TASKS = _env_int("MAX_ACTIVE_TASKS", 10)
 MAX_CONCURRENT_TASKS = _env_int("MAX_CONCURRENT_TASKS", 2)
 # 逗号分隔；留空表示只允许同源（同源请求本来就不需要 CORS）。
@@ -125,15 +126,6 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _require_api_key(request: Request) -> None:
-    """默认必须带正确的 X-API-Key；只有 ALLOW_ANONYMOUS=1 才跳过。"""
-    if ALLOW_ANONYMOUS:
-        return
-    provided = request.headers.get("X-API-Key", "")
-    if not secrets.compare_digest(provided.encode("utf-8"), APP_API_KEY.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="无效或缺失的 API Key")
-
-
 def _rate_key(request: Request) -> str:
     host = _client_ip(request)
     try:
@@ -144,6 +136,29 @@ def _rate_key(request: Request) -> str:
         # 同一个 /64 内共享一个桶，避免轮换 IPv6 地址绕过限流。
         return str(ipaddress.ip_network(f"{address}/64", strict=False))
     return str(address)
+
+
+def _record_auth_failure(request: Request) -> None:
+    now = time.monotonic()
+    key = f"auth:{_rate_key(request)}"
+    with rate_lock:
+        bucket = rate_events[key]
+        while bucket and now - bucket[0] >= 60:
+            bucket.popleft()
+        bucket.append(now)
+        if len(bucket) > AUTH_FAILURE_LIMIT:
+            raise HTTPException(status_code=429, detail="认证失败次数过多，请稍后再试")
+
+
+def _require_api_key(request: Request) -> None:
+    """默认必须带正确的 X-API-Key；只有 ALLOW_ANONYMOUS=1 才跳过。"""
+    if ALLOW_ANONYMOUS:
+        return
+    provided = request.headers.get("X-API-Key", "")
+    if not secrets.compare_digest(provided.encode("utf-8"), APP_API_KEY.encode("utf-8")):
+        # 认证失败也要计数，避免无限制猜 key。
+        _record_auth_failure(request)
+        raise HTTPException(status_code=401, detail="无效或缺失的 API Key")
 
 
 def _check_rate_limit(request: Request) -> None:
@@ -189,8 +204,9 @@ def health_check(request: Request):
 
 @app.post("/generate_report")
 def generate_report(req: PromptRequest, request: Request):
-    _require_api_key(request)
+    # 先限流再认证：失败的 key 猜测也消耗配额，不能无成本地暴力尝试。
     _check_rate_limit(request)
+    _require_api_key(request)
 
     global active_tasks
     with active_tasks_lock:
@@ -216,7 +232,9 @@ def generate_report(req: PromptRequest, request: Request):
             for step_title in initial_plan_steps:
                 task_progress[task_id]["steps"].append(
                     {
-                        "title": esc(step_title),
+                        # title/description 是纯文本；前端用 textContent 渲染。
+                        # 只有下面的 content 是 HTML，已在构造时逐项转义。
+                        "title": step_title,
                         "status": "pending",
                         "description": "等待执行",
                         "substeps": [],
@@ -321,7 +339,7 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
 
     try:
         for i, plan_step_title in enumerate(initial_plan_steps):
-            update_step_status(i, "running", esc(f"正在执行：{plan_step_title}"))
+            update_step_status(i, "running", f"正在执行：{plan_step_title}")
 
             actual_step_description, agent_name, output = executor_agent_step(
                 plan_step_title, execution_history, prompt
@@ -332,9 +350,9 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
             update_step_status(
                 i,
                 "done",
-                esc(f"已完成：{plan_step_title}"),
+                f"已完成：{plan_step_title}",
                 {
-                    "title": esc(f"调用 {agent_name}"),
+                    "title": f"调用 {agent_name}",
                     # 所有来自用户/模型的内容都必须转义；这个字符串会被前端当作 HTML 渲染。
                     "content": f"""
 <div style='border:1px solid #ccc; border-radius:8px; padding:10px; margin:8px 0; background:#fff;'>

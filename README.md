@@ -86,6 +86,7 @@
 * `ALLOW_ANONYMOUS=1`：仅本地开发/演示时使用；公网部署不要设置。
 * `MAX_PROMPT_CHARS`（默认 `4000`）
 * `RATE_LIMIT_PER_MINUTE`（默认 `5`，每个客户端 IP；IPv6 按 `/64` 聚合）
+* `AUTH_FAILURE_LIMIT`（默认 `5`，每个客户端 IP 每分钟允许的认证失败次数）
 * `MAX_RATE_BUCKETS`（默认 `10000`，超出后按最近使用时间淘汰）
 * `MAX_ACTIVE_TASKS`（默认 `10`，运行中 + 排队任务上限）
 * `MAX_CONCURRENT_TASKS`（默认 `2`，同时调用 LLM 的任务数）
