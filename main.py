@@ -1,0 +1,232 @@
+from sqlalchemy.orm.session import Session
+
+
+import os
+import uuid
+import json
+import threading
+from datetime import datetime
+from typing import Optional, Literal
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Text, DateTime, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
+
+from src.planning_agent import planner_agent, executor_agent_step
+
+import html, textwrap
+
+# === 加载环境变量 ===
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# 兼容 Heroku 的 postgres:// URL 格式
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL 未设置")
+
+
+# === 数据库初始化 ===
+Base = declarative_base()
+engine = create_engine(DATABASE_URL, echo=False, future=True)
+SessionLocal = sessionmaker[Session](bind=engine)
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id = Column(String, primary_key=True, index=True)
+    prompt = Column(Text)
+    status = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+    result = Column(Text)
+
+
+if os.getenv("RESET_DB_ON_STARTUP") == "1":
+    try:
+        Base.metadata.drop_all(bind=engine)
+    except Exception as e:
+        print(f"\u274c 数据库清理失败：{e}")
+
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"\u274c 数据库创建失败：{e}")
+
+# === FastAPI ===
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+task_progress = {}
+
+
+class PromptRequest(BaseModel):
+    prompt: str
+
+
+@app.get("/", response_class=HTMLResponse)
+def read_index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/api", response_class=JSONResponse)
+def health_check(request: Request):
+    return {"status": "ok"}
+
+
+@app.post("/generate_report")
+def generate_report(req: PromptRequest):
+    task_id = str(uuid.uuid4())
+    db = SessionLocal()
+    db.add(Task(id=task_id, prompt=req.prompt, status="running"))
+    db.commit()
+    db.close()
+
+    task_progress[task_id] = {"steps": []}
+    initial_plan_steps = planner_agent(req.prompt)
+    for step_title in initial_plan_steps:
+        task_progress[task_id]["steps"].append(
+            {
+                "title": step_title,
+                "status": "pending",
+                "description": "等待执行",
+                "substeps": [],
+            }
+        )
+
+    thread = threading.Thread(
+        target=run_agent_workflow, args=(task_id, req.prompt, initial_plan_steps)
+    )
+    thread.start()
+    return {"task_id": task_id}
+
+
+@app.get("/task_progress/{task_id}")
+def get_task_progress(task_id: str):
+    return task_progress.get(task_id, {"steps": []})
+
+
+@app.get("/task_status/{task_id}")
+def get_task_status(task_id: str):
+    db = SessionLocal()
+    task = db.query(Task).filter(Task.id == task_id).first()
+    db.close()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {
+        "status": task.status,
+        "result": json.loads(task.result) if task.result else None,
+    }
+
+
+def format_history(history):
+    return "\n\n".join(
+        f"🔹 {title}\n{desc}\n\n📝 输出：\n{output}" for title, desc, output in history
+    )
+
+
+def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
+    steps_data = task_progress[task_id]["steps"]
+    execution_history = []
+
+    def update_step_status(index, status, description="", substep=None):
+        if index < len(steps_data):
+            steps_data[index]["status"] = status
+            if description:
+                steps_data[index]["description"] = description
+            if substep:
+                steps_data[index]["substeps"].append(substep)
+            steps_data[index]["updated_at"] = datetime.utcnow().isoformat()
+
+    try:
+        for i, plan_step_title in enumerate(initial_plan_steps):
+            update_step_status(i, "running", f"正在执行：{plan_step_title}")
+
+            actual_step_description, agent_name, output = executor_agent_step(
+                plan_step_title, execution_history, prompt
+            )
+
+            execution_history.append([plan_step_title, actual_step_description, output])
+
+            def esc(s: str) -> str:
+                return html.escape(s or "")
+
+            def nl2br(s: str) -> str:
+                return esc(s).replace("\n", "<br>")
+
+            # ...
+            update_step_status(
+                i,
+                "done",
+                f"已完成：{plan_step_title}",
+                {
+                    "title": f"调用 {agent_name}",
+                    "content": f"""
+<div style='border:1px solid #ccc; border-radius:8px; padding:10px; margin:8px 0; background:#fff;'>
+  <div style='font-weight:bold; color:#2563eb;'>📘 用户提示词</div>
+  <div style='white-space:pre-wrap;'>{prompt}</div>
+
+  <div style='font-weight:bold; color:#16a34a; margin-top:8px;'>📜 上一步</div>
+  <pre style='white-space:pre-wrap; background:#f9fafb; padding:6px; border-radius:6px; margin:0;'>
+{format_history(execution_history[-2:-1])}
+  </pre>
+
+  <div style='font-weight:bold; color:#f59e0b; margin-top:8px;'>🧹 你的下一个任务</div>
+  <div style='white-space:pre-wrap;'>{actual_step_description}</div>
+
+  <div style='font-weight:bold; color:#10b981; margin-top:8px;'>✅ 输出</div>
+  <!-- ⚠️ 此处不要使用 <pre> -->
+  <div style='white-space:pre-wrap;'>
+{output}
+  </div>
+</div>
+""".strip(),
+                },
+            )
+
+        final_report_markdown = (
+            execution_history[-1][-1] if execution_history else "未生成报告。"
+        )
+
+        result = {"html_report": final_report_markdown, "history": steps_data}
+
+        db = SessionLocal()
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = "done"
+        task.result = json.dumps(result)
+        task.updated_at = datetime.utcnow()
+        db.commit()
+        db.close()
+
+    except Exception as e:
+        print(f"任务 {task_id} 的工作流出错：{e}")
+        if steps_data:
+            error_step_index = next(
+                (i for i, s in enumerate(steps_data) if s["status"] == "running"),
+                len(steps_data) - 1,
+            )
+            if error_step_index >= 0:
+                update_step_status(
+                    error_step_index,
+                    "error",
+                    f"执行过程中出错：{e}",
+                    {"title": "错误", "content": str(e)},
+                )
+
+        db = SessionLocal()
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = "error"
+        task.updated_at = datetime.utcnow()
+        db.commit()
+        db.close()
