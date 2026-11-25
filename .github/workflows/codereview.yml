@@ -124,20 +124,6 @@ jobs:
             echo "Docs-only PR: skipping the LLM step; the required check still reports success." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Restore review state
-        if: env.SAME_REPO == 'true' && steps.scope.outputs.docs_only != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          # Adjust these paths to your agent's state files.
-          # Only the SQLite cache is shared across PRs. history.jsonl is not
-          # persisted: it is fed into future prompts and is the easiest
-          # cross-PR prompt-injection vector.
-          path: |
-            data/codereview.db*
-          key: codereview-state-${{ github.repository }}-review-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            codereview-state-${{ github.repository }}-review-
-
       - name: Review PR
         if: env.SAME_REPO == 'true' && steps.scope.outputs.docs_only != 'true'
         env:
@@ -165,7 +151,7 @@ jobs:
           REVIEW_CONTEXT_ENABLED: "false"
           REVIEW_DEPENDENCY_ENABLED: "true"
           # History is prompt input from previous PRs; disable it so a
-          # same-repo PR cannot poison later reviews through the shared cache.
+          # same-repo PR cannot poison later reviews.
           REVIEW_HISTORY_ENABLED: "false"
           REVIEW_POST_EMPTY_SUMMARY: "true"
           REVIEW_POST_ON_PARTIAL: "false"
@@ -187,24 +173,3 @@ jobs:
             --repo "$REPO" \
             --pr "$PR_NUMBER" \
             --post
-
-      - name: Save review state
-        # Save even when the review failed, so a rerun can reuse embeddings.
-        # The main-scoped cache is only written by the state workflow, and only
-        # when this workflow concludes success.
-        if: always() && env.SAME_REPO == 'true' && steps.scope.outcome == 'success' && steps.scope.outputs.docs_only != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            data/codereview.db*
-          key: codereview-state-${{ github.repository }}-review-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Upload review state
-        if: always() && env.SAME_REPO == 'true' && steps.scope.outcome == 'success' && steps.scope.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: codereview-state-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            data/codereview.db*
-          if-no-files-found: ignore
-          retention-days: 3

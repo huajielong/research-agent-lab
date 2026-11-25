@@ -250,11 +250,11 @@ function fetchProgress() {
           row = document.createElement('div');
           row.id = rowId;
           row.className = `step-header ${getStatusClass(step.status)}`;
-          row.innerHTML = `${icon} ${escapeHtml(step.title)}`;
+          row.innerHTML = `${icon} ${step.title}`;
           document.getElementById('stepStatusList').appendChild(row);
         } else {
           row.className = `step-header ${getStatusClass(step.status)}`;
-          row.innerHTML = `${icon} ${escapeHtml(step.title)}`;
+          row.innerHTML = `${icon} ${step.title}`;
         }
 
         const cardId = `step-card-${index}`;
@@ -262,7 +262,7 @@ function fetchProgress() {
         const substepsHTML = substeps.map((sub, j) => `
           <div class="substep">
             <div class="substep-header" data-bs-toggle="collapse" data-bs-target="#substep-${index}-${j}" aria-expanded="false" aria-controls="substep-${index}-${j}">
-              ➕ ${escapeHtml(sub.title)}
+              ➕ ${sub.title}
             </div>
             <div id="substep-${index}-${j}" class="collapse">
               <div class="bg-light p-2 rounded" style="white-space:pre-wrap;">${renderMarkdown(sub.content)}</div>
@@ -275,18 +275,18 @@ function fetchProgress() {
           card.id = cardId;
           card.className = `card mb-3 ${getStepClass(step.status)}`;
           card.innerHTML = `
-            <div class="card-header">${escapeHtml(step.title)} — ${escapeHtml(statusLabel(step.status))}</div>
+            <div class="card-header">${step.title} — ${escapeHtml(statusLabel(step.status))}</div>
             <div class="card-body">
-              <p>${escapeHtml(step.description)}</p>
+              <p>${step.description}</p>
               ${substepsHTML}
             </div>
           `;
           document.getElementById('stepDetails').appendChild(card);
         } else {
           card.className = `card mb-3 ${getStepClass(step.status)}`;
-          card.querySelector('.card-header').textContent = `${step.title} — ${statusLabel(step.status)}`;
+          card.querySelector('.card-header').innerHTML = `${step.title} — ${escapeHtml(statusLabel(step.status))}`;
           card.querySelector('.card-body').innerHTML = `
-            <p>${escapeHtml(step.description)}</p>
+            <p>${step.description}</p>
             ${substepsHTML}
           `;
         }

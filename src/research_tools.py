@@ -104,6 +104,18 @@ def clean_text(s: str) -> str:
 
 MAX_PDF_BYTES = 50 * 1024 * 1024
 
+# arXiv 的 PDF 链接只应指向这些域名。限定域名后，攻击者无法用自己控制的
+# DNS 名做 rebinding；_is_public_http_url 仍然作为公网 IP 的纵深防御。
+ALLOWED_PDF_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "export.arxiv.org"})
+
+
+def _is_allowed_pdf_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_PDF_HOSTS and not host.endswith(".arxiv.org"):
+        return False
+    return _is_public_http_url(url)
+
 
 def _is_public_http_url(url: str) -> bool:
     """只允许 http(s) + 公网地址，阻止 file://、localhost、内网和元数据地址。
@@ -131,8 +143,8 @@ def _get_public_response(pdf_url: str, timeout: int) -> requests.Response:
     """手动跟随重定向，每一跳都校验目标地址。"""
     url = pdf_url
     for _ in range(5):
-        if not _is_public_http_url(url):
-            raise ValueError("PDF URL is not an allowed public http(s) URL")
+        if not _is_allowed_pdf_url(url):
+            raise ValueError("PDF URL is not an allowed arXiv public http(s) URL")
         response = session.get(url, timeout=timeout, allow_redirects=False, stream=True)
         if response.is_redirect:
             location = response.headers.get("location")
@@ -149,8 +161,8 @@ def fetch_pdf_bytes(pdf_url: str, timeout: int = 90) -> bytes:
     response = _get_public_response(pdf_url, timeout)
     try:
         response.raise_for_status()
-        if not _is_public_http_url(response.url):
-            raise ValueError("PDF redirect target is not an allowed public http(s) URL")
+        if not _is_allowed_pdf_url(response.url):
+            raise ValueError("PDF redirect target is not an allowed arXiv public http(s) URL")
         content = bytearray()
         for chunk in response.iter_content(chunk_size=64 * 1024):
             if not chunk:

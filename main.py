@@ -216,7 +216,7 @@ def generate_report(req: PromptRequest, request: Request):
             for step_title in initial_plan_steps:
                 task_progress[task_id]["steps"].append(
                     {
-                        "title": step_title,
+                        "title": esc(step_title),
                         "status": "pending",
                         "description": "等待执行",
                         "substeps": [],
@@ -321,7 +321,7 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
 
     try:
         for i, plan_step_title in enumerate(initial_plan_steps):
-            update_step_status(i, "running", f"正在执行：{plan_step_title}")
+            update_step_status(i, "running", esc(f"正在执行：{plan_step_title}"))
 
             actual_step_description, agent_name, output = executor_agent_step(
                 plan_step_title, execution_history, prompt
@@ -332,9 +332,9 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
             update_step_status(
                 i,
                 "done",
-                f"已完成：{plan_step_title}",
+                esc(f"已完成：{plan_step_title}"),
                 {
-                    "title": f"调用 {agent_name}",
+                    "title": esc(f"调用 {agent_name}"),
                     # 所有来自用户/模型的内容都必须转义；这个字符串会被前端当作 HTML 渲染。
                     "content": f"""
 <div style='border:1px solid #ccc; border-radius:8px; padding:10px; margin:8px 0; background:#fff;'>

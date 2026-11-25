@@ -22,21 +22,24 @@ done
 : "${POSTGRES_DB:=appdb}"
 
 # 以 postgres 用户执行命令；参数按 argv 传递，不把变量拼进 shell 字符串。
+# --preserve-environment 让 psql 能通过 \getenv 读取 POSTGRES_PASSWORD。
 as_postgres() {
   if command -v runuser >/dev/null 2>&1; then
-    runuser -u postgres -- "$@"
+    runuser --preserve-environment -u postgres -- "$@"
   else
-    su -s /bin/bash postgres -c 'exec "$@"' _ "$@"
+    su --preserve-environment -s /bin/bash postgres -c 'exec "$@"' _ "$@"
   fi
 }
 
-# 角色存在性检查：用 psql -v 传值，由 psql 负责标识符/字面量转义。
+# 角色存在性检查：用户名通过 -v 传入（不是敏感信息）。
 if ! as_postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = :'role'" \
       -v role="$POSTGRES_USER" | grep -q 1; then
-  as_postgres psql \
-    -v role="$POSTGRES_USER" \
-    -v password="$POSTGRES_PASSWORD" \
-    -c "CREATE USER :\"role\" WITH PASSWORD :'password';"
+  # 密码通过环境变量 + \getenv 读取，不出现在 psql 的 argv/cmdline 里。
+  # \getenv 需要 psql 15+；本镜像的 Debian postgresql 满足。
+  as_postgres psql -v ON_ERROR_STOP=1 -v role="$POSTGRES_USER" <<'SQL'
+\getenv password POSTGRES_PASSWORD
+CREATE USER :"role" WITH PASSWORD :'password';
+SQL
 fi
 
 # 数据库存在性检查与创建
