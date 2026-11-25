@@ -89,6 +89,8 @@
 * `AUTH_FAILURE_LIMIT`（默认 `5`，每个客户端 IP 每分钟允许的认证失败次数）
 * `POLL_RATE_LIMIT_PER_MINUTE`（默认 `120`，轮询接口每 IP 每分钟配额）
 * `MAX_RATE_BUCKETS`（默认 `10000`，超出后按最近使用时间淘汰）
+* `TRUST_PROXY_HEADERS=1`：仅当应用在可信反向代理之后、且代理会设置/覆盖
+  `X-Forwarded-For` 时启用；直接暴露公网时保持关闭。
 * `MAX_ACTIVE_TASKS`（默认 `10`，运行中 + 排队任务上限）
 * `MAX_CONCURRENT_TASKS`（默认 `2`，同时调用 LLM 的任务数）
 * `CORS_ALLOW_ORIGINS`（逗号分隔；留空 = 只允许同源）

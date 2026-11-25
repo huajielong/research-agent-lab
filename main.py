@@ -52,6 +52,14 @@ ALLOW_ANONYMOUS = os.getenv("ALLOW_ANONYMOUS", "").strip().lower() in (
     "yes",
     "on",
 )
+# 只有应用位于可信反向代理之后、且代理会设置/覆盖 X-Forwarded-For 时才启用。
+# 直接暴露到公网时保持默认关闭，否则客户端可以伪造该头绕过限流。
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 if not APP_API_KEY and not ALLOW_ANONYMOUS:
     raise RuntimeError(
         "APP_API_KEY 未设置：请设置 APP_API_KEY，"
@@ -124,6 +132,15 @@ class PromptRequest(BaseModel):
 
 
 def _client_ip(request: Request) -> str:
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            # 取最右侧地址：可信代理会把客户端地址放在最右，左侧可被伪造。
+            candidate = forwarded.split(",")[-1].strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
     return request.client.host if request.client else "unknown"
 
 
@@ -242,9 +259,10 @@ def generate_report(req: PromptRequest, request: Request):
             for step_title in initial_plan_steps:
                 task_progress[task_id]["steps"].append(
                     {
-                        # title/description 是纯文本；前端用 textContent 渲染。
+                        # title/description 统一 HTML 转义后存储；前端用
+                        # decodeHtmlEntities + textContent 还原为纯文本。
                         # 只有下面的 content 是 HTML，已在构造时逐项转义。
-                        "title": step_title,
+                        "title": esc(step_title),
                         "status": "pending",
                         "description": "等待执行",
                         "substeps": [],
@@ -352,7 +370,7 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
 
     try:
         for i, plan_step_title in enumerate(initial_plan_steps):
-            update_step_status(i, "running", f"正在执行：{plan_step_title}")
+            update_step_status(i, "running", esc(f"正在执行：{plan_step_title}"))
 
             actual_step_description, agent_name, output = executor_agent_step(
                 plan_step_title, execution_history, prompt
@@ -363,9 +381,9 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
             update_step_status(
                 i,
                 "done",
-                f"已完成：{plan_step_title}",
+                esc(f"已完成：{plan_step_title}"),
                 {
-                    "title": f"调用 {agent_name}",
+                    "title": esc(f"调用 {agent_name}"),
                     # 所有来自用户/模型的内容都必须转义；这个字符串会被前端当作 HTML 渲染。
                     "content": f"""
 <div style='border:1px solid #ccc; border-radius:8px; padding:10px; margin:8px 0; background:#fff;'>

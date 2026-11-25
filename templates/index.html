@@ -126,6 +126,15 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => map[ch]);
 }
 
+// 后端的 title/description 已 HTML 转义；这里解码回纯文本，再交给 textContent。
+// DOMParser 生成的文档是惰性的，不会执行脚本。
+function decodeHtmlEntities(value) {
+  const text = String(value ?? '');
+  if (!text) return '';
+  const doc = new DOMParser().parseFromString(text, 'text/html');
+  return doc.documentElement.textContent || '';
+}
+
 // marked 允许原始 HTML；DOMPurify 必须在插入 innerHTML 前净化。
 // 如果任一 CDN 脚本没加载成功，退化为纯文本显示，仍然不会执行脚本。
 function renderMarkdown(value) {
@@ -225,7 +234,7 @@ function makeSubstepElement(index, j, sub) {
   header.setAttribute('data-bs-target', `#substep-${index}-${j}`);
   header.setAttribute('aria-expanded', 'false');
   header.setAttribute('aria-controls', `substep-${index}-${j}`);
-  header.textContent = `➕ ${sub.title ?? ''}`;
+  header.textContent = `➕ ${decodeHtmlEntities(sub.title)}`;
 
   const collapse = document.createElement('div');
   collapse.id = `substep-${index}-${j}`;
@@ -247,7 +256,7 @@ function buildCardBody(step, index) {
   body.className = 'card-body';
 
   const description = document.createElement('p');
-  description.textContent = step.description ?? '';
+  description.textContent = decodeHtmlEntities(step.description);
   body.appendChild(description);
 
   const substeps = Array.isArray(step.substeps) ? step.substeps : [];
@@ -296,7 +305,7 @@ function fetchProgress() {
           iconNode.textContent = step.status === 'done' ? '✅' :
                                  step.status === 'error' ? '❌' : '🕓';
         }
-        row.replaceChildren(iconNode, document.createTextNode(` ${step.title ?? ''}`));
+        row.replaceChildren(iconNode, document.createTextNode(` ${decodeHtmlEntities(step.title)}`));
 
         const cardId = `step-card-${index}`;
         let card = document.getElementById(cardId);
@@ -313,7 +322,7 @@ function fetchProgress() {
           cardHeader.className = 'card-header';
           card.appendChild(cardHeader);
         }
-        cardHeader.textContent = `${step.title ?? ''} — ${statusLabel(step.status)}`;
+        cardHeader.textContent = `${decodeHtmlEntities(step.title)} — ${statusLabel(step.status)}`;
 
         const oldBody = card.querySelector('.card-body');
         const newBody = buildCardBody(step, index);
