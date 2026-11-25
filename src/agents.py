@@ -1,26 +1,30 @@
 import os
+from src.console import configure_console
+
+configure_console()
 from datetime import datetime
+from urllib import response
 from aisuite import Client
-from src.research_tools import (  # 导入时内部会 load_dotenv()
+from src.research_tools import (
     arxiv_search_tool,
     tavily_search_tool,
     wikipedia_search_tool,
 )
 
-
-def _default_model() -> str:
-    """优先用 .env 的 OPENAI_MODEL；aisuite 需要 provider:model 形式。"""
-    model = (os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
-    return model if ":" in model else f"openai:{model}"
-
-
-DEFAULT_MODEL = _default_model()
 client = Client()
+
+
+def _default_model(fallback: str) -> str:
+    """优先使用 .env 里的 OPENAI_MODEL（如 deepseek-flash），否则回退到原默认值。"""
+    m = (os.getenv("OPENAI_MODEL") or "").strip()
+    if not m:
+        return fallback
+    return m if ":" in m else f"openai:{m}"
 
 
 # === 研究智能体 ===
 def research_agent(
-    prompt: str, model: str = DEFAULT_MODEL, return_messages: bool = False
+    prompt: str, model: str = _default_model("openai:gpt-4.1-mini"), return_messages: bool = False
 ):
     print("==================================")
     print("🔍 研究智能体")
@@ -157,13 +161,12 @@ USER RESEARCH REQUEST:
 
     except Exception as e:
         print("❌ 错误：", e)
-        # 不把异常原文回显给客户端；详细原因只写服务端日志。
-        return "[模型错误：内部服务暂时不可用，请稍后重试]", messages
+        return f"[模型错误：{str(e)}]", messages
 
 
 def writer_agent(
     prompt: str,
-    model: str = DEFAULT_MODEL,
+    model: str = _default_model("openai:gpt-4.1-mini"),
     min_words_total: int = 2400,
     min_words_per_section: int = 400,
     max_tokens: int = int(os.getenv("OPENAI_MAX_TOKENS", "32000")),
@@ -252,8 +255,7 @@ INTERNAL CHECKLIST (DO NOT INCLUDE IN OUTPUT):
 
     content, finish = _call(messages)
 
-    # 推理模型的隐藏推理 token 也计入 max_tokens，达到上限时正文会被截断
-    # （finish_reason == "length"）：
+    # 模型（尤其是推理模型）达到 max_tokens 时会截断（finish_reason == "length"）：
     # - 已有可见输出：要求模型从截断处续写；
     # - 可见输出为空（token 全被隐藏推理占用）：加倍 max_tokens 重试。
     budget = max_tokens
@@ -292,7 +294,7 @@ INTERNAL CHECKLIST (DO NOT INCLUDE IN OUTPUT):
 
 def editor_agent(
     prompt: str,
-    model: str = DEFAULT_MODEL,
+    model: str = _default_model("openai:gpt-4.1-mini"),
     target_min_words: int = 2400,
 ):
     print("==================================")

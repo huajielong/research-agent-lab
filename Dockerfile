@@ -20,5 +20,5 @@ COPY . /app
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 8000
+EXPOSE 8000 5432
 CMD ["/entrypoint.sh"]

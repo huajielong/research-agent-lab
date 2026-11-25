@@ -1,16 +1,24 @@
 import json
+import os
 import re
 from typing import List
 from datetime import datetime
 from aisuite import Client
 from src.agents import (
-    DEFAULT_MODEL,
     research_agent,
     writer_agent,
     editor_agent,
 )
 
 client = Client()
+
+
+def _default_model(fallback: str) -> str:
+    """优先使用 .env 里的 OPENAI_MODEL（如 deepseek-flash），否则回退到原默认值。"""
+    m = (os.getenv("OPENAI_MODEL") or "").strip()
+    if not m:
+        return fallback
+    return m if ":" in m else f"openai:{m}"
 
 
 def clean_json_block(raw: str) -> str:
@@ -25,7 +33,7 @@ from typing import List
 import json, ast
 
 
-def planner_agent(topic: str, model: str = DEFAULT_MODEL) -> List[str]:
+def planner_agent(topic: str, model: str = _default_model("openai:o4-mini")) -> List[str]:
     prompt = f"""
 You are a planning agent responsible for organizing a research workflow using multiple intelligent agents.
 
@@ -123,7 +131,7 @@ Topic: "{topic}"
                     if "arXiv" not in s or "For each collected item" in s
                 ]
             )
-        # 确保「最终报告」始终是最后一步（main.py 会把最后一步的输出当报告）
+        # 确保「最终报告」始终是最后一步（否则 main.py 会拿最后一步的输出当报告）
         steps_list = [s for s in steps_list if s != final_required]
         if len(steps_list) >= 7:
             steps_list = steps_list[:6]

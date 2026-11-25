@@ -1,13 +1,10 @@
 from typing import List, Dict
-import ipaddress
-import socket
 import requests
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional
 import os, re, tempfile
 import requests
 from pdfminer.high_level import extract_text
-from urllib.parse import urljoin, urlparse
 
 session = requests.Session()
 session.headers.update(
@@ -102,116 +99,10 @@ def clean_text(s: str) -> str:
     return s.strip()
 
 
-MAX_PDF_BYTES = 50 * 1024 * 1024
-
-# arXiv 的 PDF 链接只应指向这些域名。限定域名后，攻击者无法用自己控制的
-# DNS 名做 rebinding；_is_public_http_url 仍然作为公网 IP 的纵深防御。
-ALLOWED_PDF_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "export.arxiv.org"})
-
-
-def _is_allowed_pdf_url(url: str) -> bool:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host not in ALLOWED_PDF_HOSTS and not host.endswith(".arxiv.org"):
-        return False
-    return _is_public_http_url(url)
-
-
-def _is_public_http_url(url: str) -> bool:
-    """只允许 http(s) + 公网地址，阻止 file://、localhost、内网和元数据地址。
-
-    这是 best-effort：DNS 解析与真正连接之间仍有 rebinding 窗口。
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return False
-    try:
-        infos = socket.getaddrinfo(parsed.hostname, None)
-    except OSError:
-        return False
-    for info in infos:
-        try:
-            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
-        except ValueError:
-            return False
-        if not address.is_global:
-            return False
-    return True
-
-
-def _connected_peer_ip(response) -> str | None:
-    """取实际连接的对端 IP；不同 urllib3 版本暴露位置不同，取不到就返回 None。"""
-    raw = getattr(response, "raw", None)
-    conn = getattr(raw, "_connection", None)
-    sock = getattr(conn, "sock", None)
-    if sock is None:
-        fp = getattr(raw, "_fp", None)
-        fp = getattr(fp, "fp", None)
-        raw_sock = getattr(fp, "raw", None)
-        sock = getattr(raw_sock, "_sock", None)
-    if sock is None:
-        return None
-    try:
-        return sock.getpeername()[0]
-    except (OSError, AttributeError):
-        return None
-
-
-def _uses_proxy(url: str) -> bool:
-    """经过代理时 peer 是代理地址，无法用它判断源站；域名白名单仍是主防线。"""
-    if session.proxies:
-        return True
-    try:
-        return bool(requests.utils.get_environ_proxies(url))
-    except Exception:
-        return False
-
-
-def _get_public_response(pdf_url: str, timeout: int) -> requests.Response:
-    """手动跟随重定向，每一跳都校验目标地址和实际连接的对端 IP。"""
-    url = pdf_url
-    for _ in range(5):
-        if not _is_allowed_pdf_url(url):
-            raise ValueError("PDF URL is not an allowed arXiv public http(s) URL")
-        response = session.get(url, timeout=timeout, allow_redirects=False, stream=True)
-        if not _uses_proxy(url):
-            peer = _connected_peer_ip(response)
-            if peer is not None:
-                try:
-                    peer_ip = ipaddress.ip_address(peer.split("%", 1)[0])
-                except ValueError:
-                    response.close()
-                    raise ValueError("PDF connected peer is not a valid IP")
-                if not peer_ip.is_global:
-                    response.close()
-                    raise ValueError("PDF connected peer is not a public IP")
-        if response.is_redirect:
-            location = response.headers.get("location")
-            response.close()
-            if not location:
-                raise ValueError("PDF redirect is missing a Location header")
-            url = urljoin(url, location)
-            continue
-        return response
-    raise ValueError("PDF URL redirected too many times")
-
-
 def fetch_pdf_bytes(pdf_url: str, timeout: int = 90) -> bytes:
-    response = _get_public_response(pdf_url, timeout)
-    try:
-        response.raise_for_status()
-        if not _is_allowed_pdf_url(response.url):
-            raise ValueError("PDF redirect target is not an allowed arXiv public http(s) URL")
-        content = bytearray()
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            content.extend(chunk)
-            if len(content) > MAX_PDF_BYTES:
-                raise ValueError("PDF exceeds the size limit")
-        return bytes(content)
-    finally:
-        response.close()
+    r = session.get(pdf_url, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.content
 
 
 def pdf_bytes_to_text(pdf_bytes: bytes, max_pages: Optional[int] = None) -> str:
@@ -398,9 +289,7 @@ def tavily_search_tool(
     """
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        # 与其他工具保持一致：返回 error 字典而不是抛异常，
-        # 否则 aisuite 的工具循环会中断整个 research_agent 回合。
-        return [{"error": "环境变量中未找到 TAVILY_API_KEY。"}]
+        raise ValueError("环境变量中未找到 TAVILY_API_KEY。")
 
     client = TavilyClient(api_key, api_base_url=os.getenv("DLAI_TAVILY_BASE_URL"))
 
@@ -461,14 +350,6 @@ tavily_tool_def = {
 
 from typing import List, Dict
 import wikipedia
-import wikipedia.wikipedia as _wikipedia
-
-# wikipedia 包默认用 http:// 且通用 UA，Wikimedia 会返回 429 纯文本，
-# 包内 r.json() 因此报 "Expecting value: line 1 column 1"。
-# 注意：wikipedia.API_URL 只是 from .wikipedia import * 的副本，
-# 必须改子模块 wikipedia.wikipedia 里的同名全局变量。
-_wikipedia.API_URL = "https://en.wikipedia.org/w/api.php"
-_wikipedia.USER_AGENT = "research-agent-lab/1.0 (local educational use)"
 
 
 def wikipedia_search_tool(query: str, sentences: int = 5) -> List[Dict]:
