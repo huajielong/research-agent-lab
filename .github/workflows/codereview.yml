@@ -169,8 +169,10 @@ jobs:
           REVIEW_HISTORY_ENABLED: "false"
           REVIEW_POST_EMPTY_SUMMARY: "true"
           REVIEW_POST_ON_PARTIAL: "false"
-          # Keep the whole repository baseline diff in one chunk.
-          REVIEW_MAX_DIFF_CHARS: "100000"
+          # DeepSeek Flash can spend the whole max_tokens budget on reasoning
+          # and return an empty finish_reason=length body. A 100K single chunk
+          # hit that on a large PR; 30K is the agent's tested chunk size.
+          REVIEW_MAX_DIFF_CHARS: "30000"
           REVIEW_POLICY_ENABLED: "true"
           REVIEW_POLICY_PATH: ".codereview/policies/security.json"
           REVIEW_PROMPT_DIR: ".codereview/prompts"
