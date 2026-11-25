@@ -1,37 +1,85 @@
 from sqlalchemy.orm.session import Session
 
-
-import os
-import uuid
+import copy
+import html
+import ipaddress
 import json
+import os
+import secrets
 import threading
+import time
+import uuid
+from collections import defaultdict, deque
 from datetime import datetime
-from typing import Optional, Literal
+
+import bleach
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Text, DateTime, String
-from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from sqlalchemy import Column, DateTime, String, Text, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-from src.planning_agent import planner_agent, executor_agent_step
-
-import html, textwrap
+from src.planning_agent import executor_agent_step, planner_agent
 
 # === 加载环境变量 ===
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL 未设置")
+
 # 兼容 Heroku 的 postgres:// URL 格式
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL 未设置")
 
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+# === 运行配置 ===
+# 默认 fail closed：必须设置 APP_API_KEY；只有显式 ALLOW_ANONYMOUS=1 才允许无 key。
+APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
+ALLOW_ANONYMOUS = os.getenv("ALLOW_ANONYMOUS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# 只有应用位于可信反向代理之后、且代理会设置/覆盖 X-Forwarded-For 时才启用。
+# 直接暴露到公网时保持默认关闭，否则客户端可以伪造该头绕过限流。
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+if not APP_API_KEY and not ALLOW_ANONYMOUS:
+    raise RuntimeError(
+        "APP_API_KEY 未设置：请设置 APP_API_KEY，"
+        "或仅在本地开发时显式设置 ALLOW_ANONYMOUS=1。"
+    )
+MAX_PROMPT_CHARS = _env_int("MAX_PROMPT_CHARS", 4000)
+RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 5)
+MAX_RATE_BUCKETS = _env_int("MAX_RATE_BUCKETS", 10_000)
+AUTH_FAILURE_LIMIT = _env_int("AUTH_FAILURE_LIMIT", 5)
+POLL_RATE_LIMIT_PER_MINUTE = _env_int("POLL_RATE_LIMIT_PER_MINUTE", 120)
+MAX_ACTIVE_TASKS = _env_int("MAX_ACTIVE_TASKS", 10)
+MAX_CONCURRENT_TASKS = _env_int("MAX_CONCURRENT_TASKS", 2)
+MAX_PROGRESS_ENTRIES = _env_int("MAX_PROGRESS_ENTRIES", 200)
+# 逗号分隔；留空表示只允许同源（同源请求本来就不需要 CORS）。
+CORS_ALLOW_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 # === 数据库初始化 ===
 Base = declarative_base()
@@ -53,26 +101,155 @@ if os.getenv("RESET_DB_ON_STARTUP") == "1":
     try:
         Base.metadata.drop_all(bind=engine)
     except Exception as e:
-        print(f"\u274c 数据库清理失败：{e}")
+        print(f"❌ 数据库清理失败：{e}")
 
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
-    print(f"\u274c 数据库创建失败：{e}")
+    print(f"❌ 数据库创建失败：{e}")
 
 # === FastAPI ===
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-task_progress = {}
+# 任务进度、并发与限流状态（单进程内；多 worker 部署时每个进程各自计数）
+task_progress: dict[str, dict] = {}
+task_progress_lock = threading.Lock()
+active_tasks = 0
+active_tasks_lock = threading.Lock()
+task_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
+rate_events: dict[str, deque] = defaultdict(deque)
+rate_lock = threading.Lock()
+
+
+# 最终报告是 writer agent 产出的 HTML。服务端先按白名单净化，前端再用
+# DOMPurify 处理一遍；不能只依赖客户端。
+ALLOWED_HTML_TAGS = [
+    "a", "abbr", "b", "blockquote", "br", "code", "div", "em", "h1", "h2",
+    "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol", "p", "pre",
+    "span", "strong", "table", "tbody", "td", "th", "thead", "tr", "ul",
+]
+ALLOWED_HTML_ATTRS = {
+    "a": ["href", "title", "rel"],
+    "img": ["src", "alt", "title", "width", "height"],
+    "code": ["class"],
+    "pre": ["class"],
+    "span": ["class"],
+    "div": ["class"],
+    "table": ["class"],
+    "td": ["class"],
+    "th": ["class"],
+}
+ALLOWED_HTML_PROTOCOLS = ["http", "https", "mailto"]
+
+
+def sanitize_html(value: str) -> str:
+    return bleach.clean(
+        value or "",
+        tags=ALLOWED_HTML_TAGS,
+        attributes=ALLOWED_HTML_ATTRS,
+        protocols=ALLOWED_HTML_PROTOCOLS,
+        strip=True,
+    )
 
 
 class PromptRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+
+
+def _client_ip(request: Request) -> str:
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            # 取最右侧地址：可信代理会把客户端地址放在最右，左侧可被伪造。
+            candidate = forwarded.split(",")[-1].strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_key(request: Request) -> str:
+    host = _client_ip(request)
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.version == 6:
+        # 同一个 /64 内共享一个桶，避免轮换 IPv6 地址绕过限流。
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
+def _prune_rate_events(now: float) -> None:
+    """在持有 rate_lock 时调用：过期/超量桶淘汰，避免字典无界增长。"""
+    if len(rate_events) <= MAX_RATE_BUCKETS:
+        return
+    expired = [
+        k
+        for k, existing in rate_events.items()
+        if not existing or now - existing[-1] >= 60
+    ]
+    for k in expired:
+        rate_events.pop(k, None)
+    if len(rate_events) > MAX_RATE_BUCKETS:
+        overflow = len(rate_events) - MAX_RATE_BUCKETS
+        oldest = sorted(
+            rate_events.items(),
+            key=lambda item: item[1][-1] if item[1] else 0.0,
+        )[:overflow]
+        for k, _ in oldest:
+            rate_events.pop(k, None)
+
+
+def _record_auth_failure(request: Request) -> None:
+    now = time.monotonic()
+    key = f"auth:{_rate_key(request)}"
+    with rate_lock:
+        bucket = rate_events[key]
+        while bucket and now - bucket[0] >= 60:
+            bucket.popleft()
+        # 先判断再追加：超限请求不再增长桶；桶上限也由 _prune_rate_events 兜底。
+        if len(bucket) >= AUTH_FAILURE_LIMIT:
+            raise HTTPException(status_code=429, detail="认证失败次数过多，请稍后再试")
+        bucket.append(now)
+        _prune_rate_events(now)
+
+
+def _require_api_key(request: Request) -> None:
+    """默认必须带正确的 X-API-Key；只有 ALLOW_ANONYMOUS=1 才跳过。"""
+    if ALLOW_ANONYMOUS:
+        return
+    provided = request.headers.get("X-API-Key", "")
+    if not secrets.compare_digest(provided.encode("utf-8"), APP_API_KEY.encode("utf-8")):
+        # 只对错误 key 计数；正确 key 不应被同 IP 的攻击者连累。
+        _record_auth_failure(request)
+        raise HTTPException(status_code=401, detail="无效或缺失的 API Key")
+
+
+def _check_rate_limit(
+    request: Request,
+    limit: int = RATE_LIMIT_PER_MINUTE,
+    prefix: str = "",
+) -> None:
+    now = time.monotonic()
+    key = f"{prefix}{_rate_key(request)}"
+    with rate_lock:
+        bucket = rate_events[key]
+        while bucket and now - bucket[0] >= 60:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+        bucket.append(now)
+        _prune_rate_events(now)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -82,52 +259,133 @@ def read_index(request: Request):
 
 @app.get("/api", response_class=JSONResponse)
 def health_check(request: Request):
-    return {"status": "ok"}
+    return {"status": "ok", "auth_required": not ALLOW_ANONYMOUS}
 
 
 @app.post("/generate_report")
-def generate_report(req: PromptRequest):
+def generate_report(req: PromptRequest, request: Request):
+    # 先限流再认证：失败的 key 猜测也消耗配额，不能无成本地暴力尝试。
+    _check_rate_limit(request)
+    _require_api_key(request)
+
+    global active_tasks
+    with active_tasks_lock:
+        if active_tasks >= MAX_ACTIVE_TASKS:
+            raise HTTPException(status_code=429, detail="当前任务过多，请稍后再试")
+        active_tasks += 1
+
     task_id = str(uuid.uuid4())
-    db = SessionLocal()
-    db.add(Task(id=task_id, prompt=req.prompt, status="running"))
-    db.commit()
-    db.close()
+    try:
+        db = SessionLocal()
+        try:
+            db.add(Task(id=task_id, prompt=req.prompt, status="running"))
+            db.commit()
+        finally:
+            db.close()
 
-    task_progress[task_id] = {"steps": []}
-    initial_plan_steps = planner_agent(req.prompt)
-    for step_title in initial_plan_steps:
-        task_progress[task_id]["steps"].append(
-            {
-                "title": step_title,
-                "status": "pending",
-                "description": "等待执行",
-                "substeps": [],
-            }
+        with task_progress_lock:
+            task_progress[task_id] = {"steps": []}
+        _prune_task_progress()
+
+        initial_plan_steps = planner_agent(req.prompt)
+
+        with task_progress_lock:
+            for step_title in initial_plan_steps:
+                task_progress[task_id]["steps"].append(
+                    {
+                        # title/description 统一 HTML 转义后存储；前端用
+                        # decodeHtmlEntities + textContent 还原为纯文本。
+                        # 只有下面的 content 是 HTML，已在构造时逐项转义。
+                        "title": esc(step_title),
+                        "status": "pending",
+                        "description": "等待执行",
+                        "substeps": [],
+                    }
+                )
+
+        thread = threading.Thread(
+            target=run_agent_workflow, args=(task_id, req.prompt, initial_plan_steps)
         )
+        thread.start()
+        return {"task_id": task_id}
+    except HTTPException:
+        with active_tasks_lock:
+            active_tasks = max(0, active_tasks - 1)
+        raise
+    except Exception as exc:
+        with active_tasks_lock:
+            active_tasks = max(0, active_tasks - 1)
+        _mark_task_failed(task_id)
+        _mark_progress_finished(task_id)
+        print(f"任务 {task_id} 启动失败：{exc}")
+        raise HTTPException(status_code=502, detail="任务启动失败，请稍后重试") from exc
 
-    thread = threading.Thread(
-        target=run_agent_workflow, args=(task_id, req.prompt, initial_plan_steps)
-    )
-    thread.start()
-    return {"task_id": task_id}
+
+def _mark_task_failed(task_id: str) -> None:
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task:
+            task.status = "error"
+            task.updated_at = datetime.utcnow()
+            db.commit()
+    except Exception as exc:
+        print(f"任务 {task_id} 状态更新失败：{exc}")
+    finally:
+        db.close()
+
+
+def _mark_progress_finished(task_id: str) -> None:
+    with task_progress_lock:
+        data = task_progress.get(task_id)
+        if data is not None:
+            data["finished"] = True
+
+
+def _prune_task_progress() -> None:
+    """完成后保留一段时间供 UI 轮询，但整体数量有上限，避免内存无界增长。"""
+    with task_progress_lock:
+        if len(task_progress) <= MAX_PROGRESS_ENTRIES:
+            return
+        overflow = len(task_progress) - MAX_PROGRESS_ENTRIES
+        finished = [tid for tid, data in task_progress.items() if data.get("finished")]
+        for tid in finished[:overflow]:
+            task_progress.pop(tid, None)
 
 
 @app.get("/task_progress/{task_id}")
-def get_task_progress(task_id: str):
-    return task_progress.get(task_id, {"steps": []})
+def get_task_progress(task_id: str, request: Request):
+    _require_api_key(request)
+    # 轮询接口用更宽松的独立配额，避免影响 2 秒一次的 UI 轮询。
+    _check_rate_limit(request, POLL_RATE_LIMIT_PER_MINUTE, "poll:")
+    with task_progress_lock:
+        data = task_progress.get(task_id)
+        return copy.deepcopy(data) if data else {"steps": []}
 
 
 @app.get("/task_status/{task_id}")
-def get_task_status(task_id: str):
+def get_task_status(task_id: str, request: Request):
+    _require_api_key(request)
+    _check_rate_limit(request, POLL_RATE_LIMIT_PER_MINUTE, "poll:")
     db = SessionLocal()
-    task = db.query(Task).filter(Task.id == task_id).first()
-    db.close()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return {
-        "status": task.status,
-        "result": json.loads(task.result) if task.result else None,
-    }
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        status = task.status
+        result_raw = task.result
+    finally:
+        db.close()
+
+    try:
+        result = json.loads(result_raw) if result_raw else None
+    except (TypeError, ValueError):
+        result = None
+    return {"status": status, "result": result}
+
+
+def esc(value) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
 
 
 def format_history(history):
@@ -137,21 +395,35 @@ def format_history(history):
 
 
 def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
-    steps_data = task_progress[task_id]["steps"]
+    global active_tasks
+    try:
+        with task_semaphore:
+            _run_agent_workflow(task_id, prompt, initial_plan_steps)
+    finally:
+        with active_tasks_lock:
+            active_tasks = max(0, active_tasks - 1)
+
+
+def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
+    with task_progress_lock:
+        task_data = task_progress.get(task_id)
+        steps_data = task_data["steps"] if task_data else []
+
     execution_history = []
 
     def update_step_status(index, status, description="", substep=None):
-        if index < len(steps_data):
-            steps_data[index]["status"] = status
-            if description:
-                steps_data[index]["description"] = description
-            if substep:
-                steps_data[index]["substeps"].append(substep)
-            steps_data[index]["updated_at"] = datetime.utcnow().isoformat()
+        with task_progress_lock:
+            if index < len(steps_data):
+                steps_data[index]["status"] = status
+                if description:
+                    steps_data[index]["description"] = description
+                if substep:
+                    steps_data[index]["substeps"].append(substep)
+                steps_data[index]["updated_at"] = datetime.utcnow().isoformat()
 
     try:
         for i, plan_step_title in enumerate(initial_plan_steps):
-            update_step_status(i, "running", f"正在执行：{plan_step_title}")
+            update_step_status(i, "running", esc(f"正在执行：{plan_step_title}"))
 
             actual_step_description, agent_name, output = executor_agent_step(
                 plan_step_title, execution_history, prompt
@@ -159,36 +431,29 @@ def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
 
             execution_history.append([plan_step_title, actual_step_description, output])
 
-            def esc(s: str) -> str:
-                return html.escape(s or "")
-
-            def nl2br(s: str) -> str:
-                return esc(s).replace("\n", "<br>")
-
-            # ...
             update_step_status(
                 i,
                 "done",
-                f"已完成：{plan_step_title}",
+                esc(f"已完成：{plan_step_title}"),
                 {
-                    "title": f"调用 {agent_name}",
+                    "title": esc(f"调用 {agent_name}"),
+                    # 所有来自用户/模型的内容都必须转义；这个字符串会被前端当作 HTML 渲染。
                     "content": f"""
 <div style='border:1px solid #ccc; border-radius:8px; padding:10px; margin:8px 0; background:#fff;'>
   <div style='font-weight:bold; color:#2563eb;'>📘 用户提示词</div>
-  <div style='white-space:pre-wrap;'>{prompt}</div>
+  <div style='white-space:pre-wrap;'>{esc(prompt)}</div>
 
   <div style='font-weight:bold; color:#16a34a; margin-top:8px;'>📜 上一步</div>
   <pre style='white-space:pre-wrap; background:#f9fafb; padding:6px; border-radius:6px; margin:0;'>
-{format_history(execution_history[-2:-1])}
+{esc(format_history(execution_history[-2:-1]))}
   </pre>
 
   <div style='font-weight:bold; color:#f59e0b; margin-top:8px;'>🧹 你的下一个任务</div>
-  <div style='white-space:pre-wrap;'>{actual_step_description}</div>
+  <div style='white-space:pre-wrap;'>{esc(actual_step_description)}</div>
 
   <div style='font-weight:bold; color:#10b981; margin-top:8px;'>✅ 输出</div>
-  <!-- ⚠️ 此处不要使用 <pre> -->
   <div style='white-space:pre-wrap;'>
-{output}
+{esc(output)}
   </div>
 </div>
 """.strip(),
@@ -199,15 +464,24 @@ def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
             execution_history[-1][-1] if execution_history else "未生成报告。"
         )
 
-        result = {"html_report": final_report_markdown, "history": steps_data}
+        with task_progress_lock:
+            history_snapshot = copy.deepcopy(steps_data)
+        result = {
+            "html_report": sanitize_html(final_report_markdown),
+            "history": history_snapshot,
+        }
 
         db = SessionLocal()
-        task = db.query(Task).filter(Task.id == task_id).first()
-        task.status = "done"
-        task.result = json.dumps(result)
-        task.updated_at = datetime.utcnow()
-        db.commit()
-        db.close()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if task:
+                task.status = "done"
+                task.result = json.dumps(result)
+                task.updated_at = datetime.utcnow()
+                db.commit()
+        finally:
+            db.close()
+        _mark_progress_finished(task_id)
 
     except Exception as e:
         print(f"任务 {task_id} 的工作流出错：{e}")
@@ -220,13 +494,9 @@ def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
                 update_step_status(
                     error_step_index,
                     "error",
-                    f"执行过程中出错：{e}",
-                    {"title": "错误", "content": str(e)},
+                    "执行过程中出错，请稍后重试",
+                    {"title": "错误", "content": "内部错误，请查看服务端日志"},
                 )
 
-        db = SessionLocal()
-        task = db.query(Task).filter(Task.id == task_id).first()
-        task.status = "error"
-        task.updated_at = datetime.utcnow()
-        db.commit()
-        db.close()
+        _mark_task_failed(task_id)
+        _mark_progress_finished(task_id)

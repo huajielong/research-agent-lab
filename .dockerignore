@@ -1,0 +1,23 @@
+# Never copy local secrets into the image layer.
+.env
+.env.*
+!.env.example
+
+# VCS / caches / local state
+.git
+.gitignore
+.gitattributes
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+data/
+tasks.db
+tasks.db.*
+*.log
+
+# Agent instructions and docs are not needed at runtime.
+AGENTS.md
+CLAUDE.md
+README.md

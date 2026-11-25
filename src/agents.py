@@ -157,7 +157,8 @@ USER RESEARCH REQUEST:
 
     except Exception as e:
         print("❌ 错误：", e)
-        return f"[模型错误：{str(e)}]", messages
+        # 不把异常原文回显给客户端；详细原因只写服务端日志。
+        return "[模型错误：内部服务暂时不可用，请稍后重试]", messages
 
 
 def writer_agent(

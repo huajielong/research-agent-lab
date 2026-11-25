@@ -3,8 +3,23 @@
 <head>
   <meta charset="UTF-8">
   <title>带工具调用能力的反思式研究智能体</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- 固定版本 + SRI：CDN 内容被篡改时浏览器拒绝执行/应用。 -->
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+    integrity="sha384-9ndCyUaIbzAi2FUVXJi0CjmCapSmO7SnpJef0486qhLnuZ2cdeRhO02iuK6FUUVM"
+    crossorigin="anonymous"
+  >
+  <script
+    src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"
+    integrity="sha384-QsSpx6a0USazT7nK7w8qXDgpSAPhFsb2XtpoLFQ5+X2yFN6hvCKnwEzN8M5FWaJb"
+    crossorigin="anonymous"
+  ></script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"
+    integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu"
+    crossorigin="anonymous"
+  ></script>
   <style>
     .step-header { cursor: pointer; }
     .step-running { background-color: #fff3cd; }
@@ -80,6 +95,19 @@
     <div class="form-text">提示：补充 3–4 个细节可以让你的问题更具体。</div>
   </div>
 
+  <!-- 服务端设置 APP_API_KEY 时才显示；密钥只保存在 sessionStorage。 -->
+  <div class="mb-3" id="apiKeyWrapper" style="display: none;">
+    <label for="apiKeyInput" class="form-label">API Key</label>
+    <input
+      type="password"
+      class="form-control"
+      id="apiKeyInput"
+      autocomplete="off"
+      placeholder="服务端设置了 APP_API_KEY 时填写"
+    >
+    <div class="form-text">仅保存在浏览器 sessionStorage，并作为 X-API-Key 请求头发送。</div>
+  </div>
+
   <div id="taskInfo" class="mb-3"></div>
   <div id="stepStatusList" class="mb-4"></div>
   <div id="stepDetails"></div>
@@ -93,21 +121,62 @@ let pollInterval = null;
 let finalReportMarkdown = "";
 const renderedSteps = new Map();
 
-function setTaskInfoGenerating(topic){
-  document.getElementById('taskInfo').innerHTML = `
+function escapeHtml(value) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  return String(value ?? '').replace(/[&<>"']/g, ch => map[ch]);
+}
+
+// 后端的 title/description 已 HTML 转义；这里解码回纯文本，再交给 textContent。
+// DOMParser 生成的文档是惰性的，不会执行脚本。
+function decodeHtmlEntities(value) {
+  const text = String(value ?? '');
+  if (!text) return '';
+  const doc = new DOMParser().parseFromString(text, 'text/html');
+  return doc.documentElement.textContent || '';
+}
+
+// marked 允许原始 HTML；DOMPurify 必须在插入 innerHTML 前净化。
+// 如果任一 CDN 脚本没加载成功，退化为纯文本显示，仍然不会执行脚本。
+function renderMarkdown(value) {
+  const text = String(value ?? '');
+  if (!window.marked) return escapeHtml(text);
+  const rendered = marked.parse(text);
+  return window.DOMPurify ? DOMPurify.sanitize(rendered) : escapeHtml(rendered);
+}
+
+function getApiKey() {
+  try { return sessionStorage.getItem('researchAgentApiKey') || ''; } catch { return ''; }
+}
+
+function apiHeaders(extra = {}) {
+  const key = getApiKey();
+  return key ? { ...extra, 'X-API-Key': key } : extra;
+}
+
+function showError(message) {
+  const info = document.getElementById('taskInfo');
+  if (info) info.textContent = `❌ ${message}`;
+  disableUI(false);
+}
+
+function setTaskInfoGenerating(topic) {
+  const info = document.getElementById('taskInfo');
+  info.innerHTML = `
     <h5 class="d-flex align-items-center">
-      <span class="me-2">⚙️ 正在为以下研究主题生成步骤：<code>${topic}</code></span>
+      <span class="me-2">⚙️ 正在为以下研究主题生成步骤：<code id="taskTopic"></code></span>
       <span id="stepsIcon"><span class='spinner-border spinner-border-sm text-primary'></span></span>
     </h5>
   `;
+  const topicNode = document.getElementById('taskTopic');
+  if (topicNode) topicNode.textContent = topic;
 }
 
-function setStepsGenerated(){
+function setStepsGenerated() {
   const stepsIcon = document.getElementById('stepsIcon');
   if (stepsIcon) stepsIcon.textContent = '✅';
 }
 
-function disableUI(disabled){
+function disableUI(disabled) {
   const btn = document.querySelector('button.btn.btn-primary');
   const input = document.getElementById('promptInput');
   if (btn) btn.disabled = disabled;
@@ -118,16 +187,29 @@ function submitPrompt() {
   const prompt = document.getElementById('promptInput').value;
   if (!prompt) return;
 
+  const apiKeyInput = document.getElementById('apiKeyInput');
+  const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+  try {
+    if (apiKey) sessionStorage.setItem('researchAgentApiKey', apiKey);
+    else sessionStorage.removeItem('researchAgentApiKey');
+  } catch { /* storage may be disabled */ }
+
   currentTopic = prompt;
   setTaskInfoGenerating(currentTopic);
   disableUI(true);
 
   fetch('/generate_report', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ prompt })
   })
-  .then(res => res.json())
+  .then(async res => {
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `请求失败 (${res.status})`);
+    }
+    return res.json();
+  })
   .then(data => {
     currentTaskId = data.task_id;
 
@@ -139,18 +221,60 @@ function submitPrompt() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(fetchProgress, 2000);
   })
-  .catch(() => {
-    const statusIcon = document.getElementById('statusIcon');
-    if (statusIcon) statusIcon.textContent = '❌';
-    disableUI(false);
-  });
+  .catch(err => showError(err.message || '请求失败'));
+}
+
+function makeSubstepElement(index, j, sub) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'substep';
+
+  const header = document.createElement('div');
+  header.className = 'substep-header';
+  header.setAttribute('data-bs-toggle', 'collapse');
+  header.setAttribute('data-bs-target', `#substep-${index}-${j}`);
+  header.setAttribute('aria-expanded', 'false');
+  header.setAttribute('aria-controls', `substep-${index}-${j}`);
+  header.textContent = `➕ ${decodeHtmlEntities(sub.title)}`;
+
+  const collapse = document.createElement('div');
+  collapse.id = `substep-${index}-${j}`;
+  collapse.className = 'collapse';
+
+  const content = document.createElement('div');
+  content.className = 'bg-light p-2 rounded';
+  content.style.whiteSpace = 'pre-wrap';
+  // 只有经过 marked + DOMPurify 的内容才允许进 innerHTML。
+  content.innerHTML = renderMarkdown(sub.content);
+
+  collapse.appendChild(content);
+  wrapper.append(header, collapse);
+  return wrapper;
+}
+
+function buildCardBody(step, index) {
+  const body = document.createElement('div');
+  body.className = 'card-body';
+
+  const description = document.createElement('p');
+  description.textContent = decodeHtmlEntities(step.description);
+  body.appendChild(description);
+
+  const substeps = Array.isArray(step.substeps) ? step.substeps : [];
+  substeps.forEach((sub, j) => body.appendChild(makeSubstepElement(index, j, sub)));
+  return body;
 }
 
 function fetchProgress() {
   if (!currentTaskId) return;
 
-  fetch(`/task_progress/${currentTaskId}`)
-    .then(res => res.json())
+  fetch(`/task_progress/${currentTaskId}`, { headers: apiHeaders() })
+    .then(async res => {
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `进度查询失败 (${res.status})`);
+      }
+      return res.json();
+    })
     .then(data => {
       const { steps } = data;
 
@@ -158,74 +282,74 @@ function fetchProgress() {
         setStepsGenerated();
       }
 
-      steps.forEach((step, index) => {
-        const stepKey = `${step.title}-${step.status}-${step.substeps.length}`;
+      (steps || []).forEach((step, index) => {
+        const substeps = Array.isArray(step.substeps) ? step.substeps : [];
+        const stepKey = `${step.title}-${step.status}-${substeps.length}`;
         if (renderedSteps.get(index) === stepKey) return;
 
         renderedSteps.set(index, stepKey);
-
-        const icon = step.status === 'done' ? '✅' :
-                     step.status === 'running' ? '<span class="spinner-border spinner-border-sm text-warning"></span>' :
-                     step.status === 'error' ? '❌' : '🕓';
 
         const rowId = `step-row-${index}`;
         let row = document.getElementById(rowId);
         if (!row) {
           row = document.createElement('div');
           row.id = rowId;
-          row.className = `step-header ${getStatusClass(step.status)}`;
-          row.innerHTML = `${icon} ${step.title}`;
           document.getElementById('stepStatusList').appendChild(row);
-        } else {
-          row.className = `step-header ${getStatusClass(step.status)}`;
-          row.innerHTML = `${icon} ${step.title}`;
         }
+        row.className = `step-header ${getStatusClass(step.status)}`;
+
+        const iconNode = document.createElement('span');
+        if (step.status === 'running') {
+          iconNode.className = 'spinner-border spinner-border-sm text-warning';
+        } else {
+          iconNode.textContent = step.status === 'done' ? '✅' :
+                                 step.status === 'error' ? '❌' : '🕓';
+        }
+        row.replaceChildren(iconNode, document.createTextNode(` ${decodeHtmlEntities(step.title)}`));
 
         const cardId = `step-card-${index}`;
         let card = document.getElementById(cardId);
-        const substepsHTML = step.substeps.map((sub, j) => `
-          <div class="substep">
-            <div class="substep-header" data-bs-toggle="collapse" data-bs-target="#substep-${index}-${j}" aria-expanded="false" aria-controls="substep-${index}-${j}">
-              ➕ ${sub.title}
-            </div>
-            <div id="substep-${index}-${j}" class="collapse">
-              <div class="bg-light p-2 rounded" style="white-space:pre-wrap;">${marked.parse(sub.content)}</div>
-            </div>
-          </div>
-        `).join('');
-
         if (!card) {
           card = document.createElement('div');
           card.id = cardId;
-          card.className = `card mb-3 ${getStepClass(step.status)}`;
-          card.innerHTML = `
-            <div class="card-header">${step.title} — ${statusLabel(step.status)}</div>
-            <div class="card-body">
-              <p>${step.description}</p>
-              ${substepsHTML}
-            </div>
-          `;
           document.getElementById('stepDetails').appendChild(card);
-        } else {
-          card.className = `card mb-3 ${getStepClass(step.status)}`;
-          card.querySelector('.card-header').textContent = `${step.title} — ${statusLabel(step.status)}`;
-          card.querySelector('.card-body').innerHTML = `
-            <p>${step.description}</p>
-            ${substepsHTML}
-          `;
         }
+        card.className = `card mb-3 ${getStepClass(step.status)}`;
+
+        let cardHeader = card.querySelector('.card-header');
+        if (!cardHeader) {
+          cardHeader = document.createElement('div');
+          cardHeader.className = 'card-header';
+          card.appendChild(cardHeader);
+        }
+        cardHeader.textContent = `${decodeHtmlEntities(step.title)} — ${statusLabel(step.status)}`;
+
+        const oldBody = card.querySelector('.card-body');
+        const newBody = buildCardBody(step, index);
+        if (oldBody) oldBody.replaceWith(newBody);
+        else card.appendChild(newBody);
       });
 
       fetchTaskStatus();
     })
-    .catch(() => {
-      // silent
+    .catch(err => {
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+      showError(err.message || '进度查询失败');
     });
 }
 
 function fetchTaskStatus() {
-  fetch(`/task_status/${currentTaskId}`)
-    .then(res => res.json())
+  fetch(`/task_status/${currentTaskId}`, { headers: apiHeaders() })
+    .then(async res => {
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `状态查询失败 (${res.status})`);
+      }
+      return res.json();
+    })
     .then(task => {
       const statusIcon = document.getElementById('statusIcon');
 
@@ -251,9 +375,16 @@ function fetchTaskStatus() {
             <button class="btn btn-outline-secondary btn-sm me-2" onclick="downloadMarkdown()">⬇️ 下载 .md</button>
             <button class="btn btn-outline-secondary btn-sm" onclick="downloadHTML()">⬇️ 下载 .html</button>
           </div>
-          <div id="finalReport">${marked.parse(finalReportMarkdown)}</div>
+          <div id="finalReport">${renderMarkdown(finalReportMarkdown)}</div>
         `;
       }
+    })
+    .catch(err => {
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+      showError(err.message || '状态查询失败');
     });
 }
 
@@ -284,14 +415,33 @@ function downloadMarkdown() {
 }
 
 function downloadHTML() {
-  const htmlContent = marked.parse(finalReportMarkdown);
-  const blob = new Blob([htmlContent], { type: 'text/html' });
+  const blob = new Blob([renderMarkdown(finalReportMarkdown)], { type: 'text/html' });
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
   link.download = `final_report_${currentTaskId}.html`;
   link.click();
 }
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const apiKeyInput = document.getElementById('apiKeyInput');
+  if (apiKeyInput) apiKeyInput.value = getApiKey();
+
+  try {
+    const res = await fetch('/api');
+    const data = await res.json();
+    const wrapper = document.getElementById('apiKeyWrapper');
+    if (wrapper && data.auth_required) wrapper.style.display = '';
+  } catch {
+    // 健康检查失败时也显示输入框，方便用户填写 key 后重试。
+    const wrapper = document.getElementById('apiKeyWrapper');
+    if (wrapper) wrapper.style.display = '';
+  }
+});
 </script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script
+  src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"
+  integrity="sha384-geWF76RCwLtnZ8qwWowPQNguL3RmwHVBC9FhGdlKrxdiJJigb/j/68SIy3Te4Bkz"
+  crossorigin="anonymous"
+></script>
 </body>
 </html>
