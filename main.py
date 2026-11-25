@@ -61,6 +61,7 @@ MAX_PROMPT_CHARS = _env_int("MAX_PROMPT_CHARS", 4000)
 RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 5)
 MAX_RATE_BUCKETS = _env_int("MAX_RATE_BUCKETS", 10_000)
 AUTH_FAILURE_LIMIT = _env_int("AUTH_FAILURE_LIMIT", 5)
+POLL_RATE_LIMIT_PER_MINUTE = _env_int("POLL_RATE_LIMIT_PER_MINUTE", 120)
 MAX_ACTIVE_TASKS = _env_int("MAX_ACTIVE_TASKS", 10)
 MAX_CONCURRENT_TASKS = _env_int("MAX_CONCURRENT_TASKS", 2)
 # 逗号分隔；留空表示只允许同源（同源请求本来就不需要 CORS）。
@@ -138,6 +139,27 @@ def _rate_key(request: Request) -> str:
     return str(address)
 
 
+def _prune_rate_events(now: float) -> None:
+    """在持有 rate_lock 时调用：过期/超量桶淘汰，避免字典无界增长。"""
+    if len(rate_events) <= MAX_RATE_BUCKETS:
+        return
+    expired = [
+        k
+        for k, existing in rate_events.items()
+        if not existing or now - existing[-1] >= 60
+    ]
+    for k in expired:
+        rate_events.pop(k, None)
+    if len(rate_events) > MAX_RATE_BUCKETS:
+        overflow = len(rate_events) - MAX_RATE_BUCKETS
+        oldest = sorted(
+            rate_events.items(),
+            key=lambda item: item[1][-1] if item[1] else 0.0,
+        )[:overflow]
+        for k, _ in oldest:
+            rate_events.pop(k, None)
+
+
 def _record_auth_failure(request: Request) -> None:
     now = time.monotonic()
     key = f"auth:{_rate_key(request)}"
@@ -145,9 +167,11 @@ def _record_auth_failure(request: Request) -> None:
         bucket = rate_events[key]
         while bucket and now - bucket[0] >= 60:
             bucket.popleft()
-        bucket.append(now)
-        if len(bucket) > AUTH_FAILURE_LIMIT:
+        # 先判断再追加：超限请求不再增长桶；桶上限也由 _prune_rate_events 兜底。
+        if len(bucket) >= AUTH_FAILURE_LIMIT:
             raise HTTPException(status_code=429, detail="认证失败次数过多，请稍后再试")
+        bucket.append(now)
+        _prune_rate_events(now)
 
 
 def _require_api_key(request: Request) -> None:
@@ -156,40 +180,26 @@ def _require_api_key(request: Request) -> None:
         return
     provided = request.headers.get("X-API-Key", "")
     if not secrets.compare_digest(provided.encode("utf-8"), APP_API_KEY.encode("utf-8")):
-        # 认证失败也要计数，避免无限制猜 key。
+        # 只对错误 key 计数；正确 key 不应被同 IP 的攻击者连累。
         _record_auth_failure(request)
         raise HTTPException(status_code=401, detail="无效或缺失的 API Key")
 
 
-def _check_rate_limit(request: Request) -> None:
+def _check_rate_limit(
+    request: Request,
+    limit: int = RATE_LIMIT_PER_MINUTE,
+    prefix: str = "",
+) -> None:
     now = time.monotonic()
-    key = _rate_key(request)
+    key = f"{prefix}{_rate_key(request)}"
     with rate_lock:
         bucket = rate_events[key]
         while bucket and now - bucket[0] >= 60:
             bucket.popleft()
-        if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+        if len(bucket) >= limit:
             raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
         bucket.append(now)
-
-        if len(rate_events) > MAX_RATE_BUCKETS:
-            # 先清掉过期桶；仍超限则按最近一次请求时间淘汰最旧的桶。
-            # 不要整体 clear()：否则攻击者可以用大量源地址重置所有桶。
-            expired = [
-                k
-                for k, existing in rate_events.items()
-                if not existing or now - existing[-1] >= 60
-            ]
-            for k in expired:
-                rate_events.pop(k, None)
-            if len(rate_events) > MAX_RATE_BUCKETS:
-                overflow = len(rate_events) - MAX_RATE_BUCKETS
-                oldest = sorted(
-                    rate_events.items(),
-                    key=lambda item: item[1][-1] if item[1] else 0.0,
-                )[:overflow]
-                for k, _ in oldest:
-                    rate_events.pop(k, None)
+        _prune_rate_events(now)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -275,6 +285,8 @@ def _mark_task_failed(task_id: str) -> None:
 @app.get("/task_progress/{task_id}")
 def get_task_progress(task_id: str, request: Request):
     _require_api_key(request)
+    # 轮询接口用更宽松的独立配额，避免影响 2 秒一次的 UI 轮询。
+    _check_rate_limit(request, POLL_RATE_LIMIT_PER_MINUTE, "poll:")
     with task_progress_lock:
         data = task_progress.get(task_id)
         return copy.deepcopy(data) if data else {"steps": []}
@@ -283,6 +295,7 @@ def get_task_progress(task_id: str, request: Request):
 @app.get("/task_status/{task_id}")
 def get_task_status(task_id: str, request: Request):
     _require_api_key(request)
+    _check_rate_limit(request, POLL_RATE_LIMIT_PER_MINUTE, "poll:")
     db = SessionLocal()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
