@@ -4,6 +4,7 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 jinja2
+bleach
 openai
 tavily-python
 wikipedia

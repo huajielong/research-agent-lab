@@ -12,6 +12,7 @@ import uuid
 from collections import defaultdict, deque
 from datetime import datetime
 
+import bleach
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -125,6 +126,37 @@ active_tasks_lock = threading.Lock()
 task_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
 rate_events: dict[str, deque] = defaultdict(deque)
 rate_lock = threading.Lock()
+
+
+# 最终报告是 writer agent 产出的 HTML。服务端先按白名单净化，前端再用
+# DOMPurify 处理一遍；不能只依赖客户端。
+ALLOWED_HTML_TAGS = [
+    "a", "abbr", "b", "blockquote", "br", "code", "div", "em", "h1", "h2",
+    "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol", "p", "pre",
+    "span", "strong", "table", "tbody", "td", "th", "thead", "tr", "ul",
+]
+ALLOWED_HTML_ATTRS = {
+    "a": ["href", "title", "rel"],
+    "img": ["src", "alt", "title", "width", "height"],
+    "code": ["class"],
+    "pre": ["class"],
+    "span": ["class"],
+    "div": ["class"],
+    "table": ["class"],
+    "td": ["class"],
+    "th": ["class"],
+}
+ALLOWED_HTML_PROTOCOLS = ["http", "https", "mailto"]
+
+
+def sanitize_html(value: str) -> str:
+    return bleach.clean(
+        value or "",
+        tags=ALLOWED_HTML_TAGS,
+        attributes=ALLOWED_HTML_ATTRS,
+        protocols=ALLOWED_HTML_PROTOCOLS,
+        strip=True,
+    )
 
 
 class PromptRequest(BaseModel):
@@ -413,7 +445,10 @@ def _run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
 
         with task_progress_lock:
             history_snapshot = copy.deepcopy(steps_data)
-        result = {"html_report": final_report_markdown, "history": history_snapshot}
+        result = {
+            "html_report": sanitize_html(final_report_markdown),
+            "history": history_snapshot,
+        }
 
         db = SessionLocal()
         try:

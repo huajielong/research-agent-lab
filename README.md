@@ -53,7 +53,8 @@
 
 * Python 依赖由 Docker 根据 `requirements.txt` 自动安装：
 
-  * `fastapi`、`uvicorn`、`sqlalchemy`、`python-dotenv`、`jinja2`、`requests`、`wikipedia` 等。
+  * `fastapi`、`uvicorn`、`sqlalchemy`、`python-dotenv`、`jinja2`、`bleach`、
+    `requests`、`wikipedia` 等。
   * 以及你的 `aisuite` 客户端所需的全部依赖库。
 
 ---
@@ -67,14 +68,15 @@
   ```
   postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@127.0.0.1:5432/<POSTGRES_DB>
   ```
-* **`POSTGRES_PASSWORD` 必须显式设置**；入口脚本不再使用默认口令。先
-  `cp .env.example .env`，再把 `POSTGRES_PASSWORD` 改成你自己的值。
+* **`POSTGRES_PASSWORD` 必须显式设置**；入口脚本不再使用默认口令，留空会直接
+  启动失败。先 `cp .env.example .env`，再用
+  `openssl rand -hex 24` 生成一个强密码填进去（不要用示例/弱口令）。
 * 如需使用 Tavily：提供 `TAVILY_API_KEY`（通过 `.env` 或 `-e` 传入）。
 
 数据库相关：
 
 * `POSTGRES_USER`（默认 `app`）
-* `POSTGRES_PASSWORD`（**必填**）
+* `POSTGRES_PASSWORD`（**必填**，使用强随机值；不要用示例/弱口令）
 * `POSTGRES_DB`（默认 `appdb`）
 * `DATABASE_URL`（可选；不设置时入口脚本自动生成；本地非 Docker 可设为
   `sqlite:///...`）
@@ -108,6 +110,8 @@
 
 * `.env` 同时被 `.gitignore` 和 `.dockerignore` 忽略，`docker build` 不会把本地密钥打进镜像。
 * 默认必须设置 `APP_API_KEY`；只有本地开发/演示可以显式设置 `ALLOW_ANONYMOUS=1`。
+* 默认不发布 Postgres 的 5432 端口；数据库只在容器内可达。需要宿主机直连时再显式
+  加 `-p 5432:5432`，并使用强 `POSTGRES_PASSWORD`。
 * 接口有每 IP 每分钟限流、提示词长度上限、活动任务上限和并发 LLM 上限；这些按单进程计数，
   多 worker 部署需在反向代理层再加限流。
 * 前端用 DOMPurify 净化 `marked` 输出；后端对用户 prompt 和 agent 输出做 HTML 转义。
@@ -126,7 +130,7 @@ docker build -t fastapi-postgres-service .
 ### 2) 运行（前台）
 
 ```bash
-docker run --rm -it  -p 8000:8000  -p 5432:5432  --name fpsvc  --env-file .env  fastapi-postgres-service
+docker run --rm -it  -p 8000:8000  --name fpsvc  --env-file .env  fastapi-postgres-service
 ```
 
 你应该能看到类似下面的日志：
@@ -236,7 +240,7 @@ TAVILY_API_KEY=your-tavily-api-key
 * **热重载**（可选）：在开发时，如果你挂载了代码目录，可以用 `--reload` 运行 Uvicorn：
 
   ```bash
-  docker run --rm -it -p 8000:8000 -p 5432:5432 \
+  docker run --rm -it -p 8000:8000 \
     -v "$PWD":/app \
     --name fpsvc fastapi-postgres-service \
     bash -lc "pg_ctlcluster \$(psql -V | awk '{print \$3}' | cut -d. -f1) main start && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
@@ -244,9 +248,12 @@ TAVILY_API_KEY=your-tavily-api-key
 
 * **从宿主机连接数据库：**
 
+  默认的 `docker run` **不发布 5432**，数据库只在容器内可达。确实需要宿主机直连时，
+  给 `docker run` 额外加 `-p 5432:5432`，并使用强密码：
+
   ```bash
-  psql "postgresql://app:change-me@localhost:5432/appdb"
-  # 把 change-me 换成你在 .env 里设置的 POSTGRES_PASSWORD
+  psql "postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/appdb"
+  # POSTGRES_PASSWORD 是你在 .env 里设置的强密码
   ```
 
 ---
