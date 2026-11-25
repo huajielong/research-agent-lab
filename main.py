@@ -2,6 +2,7 @@ from sqlalchemy.orm.session import Session
 
 import copy
 import html
+import ipaddress
 import json
 import os
 import secrets
@@ -43,10 +44,22 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 # === 运行配置 ===
-# 可选：设置后 /generate_report、/task_progress、/task_status 需要 X-API-Key。
+# 默认 fail closed：必须设置 APP_API_KEY；只有显式 ALLOW_ANONYMOUS=1 才允许无 key。
 APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
+ALLOW_ANONYMOUS = os.getenv("ALLOW_ANONYMOUS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+if not APP_API_KEY and not ALLOW_ANONYMOUS:
+    raise RuntimeError(
+        "APP_API_KEY 未设置：请设置 APP_API_KEY，"
+        "或仅在本地开发时显式设置 ALLOW_ANONYMOUS=1。"
+    )
 MAX_PROMPT_CHARS = _env_int("MAX_PROMPT_CHARS", 4000)
 RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 5)
+MAX_RATE_BUCKETS = _env_int("MAX_RATE_BUCKETS", 10_000)
 MAX_ACTIVE_TASKS = _env_int("MAX_ACTIVE_TASKS", 10)
 MAX_CONCURRENT_TASKS = _env_int("MAX_CONCURRENT_TASKS", 2)
 # 逗号分隔；留空表示只允许同源（同源请求本来就不需要 CORS）。
@@ -113,30 +126,55 @@ def _client_ip(request: Request) -> str:
 
 
 def _require_api_key(request: Request) -> None:
-    """APP_API_KEY 非空时，任务相关接口必须带正确的 X-API-Key。
-
-    留空是为了不破坏本地/演示环境的网页 UI；对外部署请务必设置。
-    """
-    if not APP_API_KEY:
+    """默认必须带正确的 X-API-Key；只有 ALLOW_ANONYMOUS=1 才跳过。"""
+    if ALLOW_ANONYMOUS:
         return
     provided = request.headers.get("X-API-Key", "")
     if not secrets.compare_digest(provided.encode("utf-8"), APP_API_KEY.encode("utf-8")):
         raise HTTPException(status_code=401, detail="无效或缺失的 API Key")
 
 
+def _rate_key(request: Request) -> str:
+    host = _client_ip(request)
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.version == 6:
+        # 同一个 /64 内共享一个桶，避免轮换 IPv6 地址绕过限流。
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
 def _check_rate_limit(request: Request) -> None:
     now = time.monotonic()
-    client = _client_ip(request)
+    key = _rate_key(request)
     with rate_lock:
-        # 防止大量不同 IP 把字典撑爆；达到上限时整体清空并重新计数。
-        if len(rate_events) > 10_000:
-            rate_events.clear()
-        bucket = rate_events[client]
+        bucket = rate_events[key]
         while bucket and now - bucket[0] >= 60:
             bucket.popleft()
         if len(bucket) >= RATE_LIMIT_PER_MINUTE:
             raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
         bucket.append(now)
+
+        if len(rate_events) > MAX_RATE_BUCKETS:
+            # 先清掉过期桶；仍超限则按最近一次请求时间淘汰最旧的桶。
+            # 不要整体 clear()：否则攻击者可以用大量源地址重置所有桶。
+            expired = [
+                k
+                for k, existing in rate_events.items()
+                if not existing or now - existing[-1] >= 60
+            ]
+            for k in expired:
+                rate_events.pop(k, None)
+            if len(rate_events) > MAX_RATE_BUCKETS:
+                overflow = len(rate_events) - MAX_RATE_BUCKETS
+                oldest = sorted(
+                    rate_events.items(),
+                    key=lambda item: item[1][-1] if item[1] else 0.0,
+                )[:overflow]
+                for k, _ in oldest:
+                    rate_events.pop(k, None)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -146,7 +184,7 @@ def read_index(request: Request):
 
 @app.get("/api", response_class=JSONResponse)
 def health_check(request: Request):
-    return {"status": "ok", "auth_required": bool(APP_API_KEY)}
+    return {"status": "ok", "auth_required": not ALLOW_ANONYMOUS}
 
 
 @app.post("/generate_report")

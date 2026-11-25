@@ -47,7 +47,9 @@
   ```
 
   `.env` 已被 `.gitignore` 忽略；仓库里只保留不含密钥的 `.env.example`。
-  `OPENAI_MODEL` 用于指定模型名（不填时默认 `gpt-4.1-mini`，代码会自动补 `openai:` 前缀）。
+  `.env` 里必须设置 `APP_API_KEY`（默认 fail closed）；本地演示可改用
+  `ALLOW_ANONYMOUS=1`。`OPENAI_MODEL` 用于指定模型名（不填时默认
+  `gpt-4.1-mini`，代码会自动补 `openai:` 前缀）。
 
 * Python 依赖由 Docker 根据 `requirements.txt` 自动安装：
 
@@ -77,12 +79,14 @@
 * `DATABASE_URL`（可选；不设置时入口脚本自动生成；本地非 Docker 可设为
   `sqlite:///...`）
 
-运行安全配置（可选）：
+运行安全配置：
 
-* `APP_API_KEY`：设置后 `/generate_report`、`/task_progress`、`/task_status`
-  需要 `X-API-Key` 请求头。
+* `APP_API_KEY`（**默认必填**）：`/generate_report`、`/task_progress`、
+  `/task_status` 需要 `X-API-Key` 请求头。未设置且未显式允许匿名时，应用会拒绝启动。
+* `ALLOW_ANONYMOUS=1`：仅本地开发/演示时使用；公网部署不要设置。
 * `MAX_PROMPT_CHARS`（默认 `4000`）
-* `RATE_LIMIT_PER_MINUTE`（默认 `5`，每个客户端 IP）
+* `RATE_LIMIT_PER_MINUTE`（默认 `5`，每个客户端 IP；IPv6 按 `/64` 聚合）
+* `MAX_RATE_BUCKETS`（默认 `10000`，超出后按最近使用时间淘汰）
 * `MAX_ACTIVE_TASKS`（默认 `10`，运行中 + 排队任务上限）
 * `MAX_CONCURRENT_TASKS`（默认 `2`，同时调用 LLM 的任务数）
 * `CORS_ALLOW_ORIGINS`（逗号分隔；留空 = 只允许同源）
@@ -99,10 +103,11 @@
 ## 安全说明
 
 * `.env` 同时被 `.gitignore` 和 `.dockerignore` 忽略，`docker build` 不会把本地密钥打进镜像。
-* 生产/公网部署请设置 `APP_API_KEY`；否则任何能访问服务的人都能消耗你的 LLM/Tavily 额度。
+* 默认必须设置 `APP_API_KEY`；只有本地开发/演示可以显式设置 `ALLOW_ANONYMOUS=1`。
 * 接口有每 IP 每分钟限流、提示词长度上限、活动任务上限和并发 LLM 上限；这些按单进程计数，
   多 worker 部署需在反向代理层再加限流。
 * 前端用 DOMPurify 净化 `marked` 输出；后端对用户 prompt 和 agent 输出做 HTML 转义。
+  CDN 资源同时使用固定版本和 SRI，CDN 内容被篡改时浏览器会拒绝加载。
 
 ---
 
