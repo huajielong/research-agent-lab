@@ -3,8 +3,8 @@
 # GitHub caches created by a pull_request run are scoped to that PR's merge ref
 # and are not visible to sibling PRs. This workflow runs on the default branch
 # after "AI code review" finishes, downloads the PR run's state artifact, and
-# saves it under a main-scoped cache key. Later PRs restore that key, so
-# embeddings and historical findings accumulate across PRs.
+# saves it under a main-scoped cache key. Later PRs restore that key, so the
+# embedding/chunk/review cache accumulates across PRs. History is excluded.
 #
 # Copy to .github/workflows/codereview-state.yml. It only takes effect once it
 # is on the default branch.
@@ -12,8 +12,12 @@
 # Security notes:
 # - Only persist artifacts from same-repository PRs. Fork PRs can upload an
 #   artifact with the same name; validating its contents is not enough.
-# - Validate the SQLite schema and every history line before writing a shared
-#   cache. A malformed artifact must not poison future reviews.
+# - Only the SQLite cache is persisted. history.jsonl is deliberately excluded:
+#   it is fed into future review prompts and is the easiest cross-PR
+#   prompt-injection vector. The cache is still best-effort, last-writer-wins,
+#   and not a security boundary.
+# - Validate the SQLite schema before writing a shared cache. A malformed
+#   artifact must not poison future reviews.
 # - Serialize saves with a non-cancelling concurrency group. The cache is still
 #   last-writer-wins for concurrent PRs; this only prevents overlapping writes.
 
@@ -59,7 +63,6 @@ jobs:
           REQUIRED_TABLES: "embeddings,chunk_cache,posted_reviews"
         run: |
           python3 -I - <<'PY'
-          import json
           import os
           import pathlib
           import sqlite3
@@ -81,11 +84,6 @@ jobs:
           if missing:
               raise SystemExit(f"missing tables: {sorted(missing)}")
 
-          history = pathlib.Path("data/history.jsonl")
-          if history.exists():
-              for line in history.read_text(encoding="utf-8").splitlines():
-                  if line.strip():
-                      json.loads(line)
           print("review state validation ok")
           PY
 
@@ -95,5 +93,4 @@ jobs:
         with:
           path: |
             data/codereview.db*
-            data/history.jsonl
           key: codereview-state-${{ github.repository }}-review-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}

@@ -3,8 +3,9 @@
 # Copy to .github/workflows/codereview.yml.
 #
 # Repository variables:
-#   CODEREVIEW_AGENT_REPO   owner/agent-repo   (default: OWNER/codereview-agent)
-#   CODEREVIEW_AGENT_REF    branch, tag, SHA   (default: main; use a SHA in production)
+#   CODEREVIEW_AGENT_REPO   owner/agent-repo   (required)
+#   CODEREVIEW_AGENT_REF    full 40-character commit SHA (required; the job
+#                           fails closed if it is unset or not a SHA)
 #
 # Repository secrets:
 #   OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
@@ -54,12 +55,27 @@ jobs:
           echo "::error::Fork PRs do not receive repository secrets. Review manually or use a trusted workflow."
           exit 1
 
+      - name: Require pinned agent ref
+        if: env.SAME_REPO == 'true'
+        env:
+          AGENT_REPO: ${{ vars.CODEREVIEW_AGENT_REPO }}
+          AGENT_REF: ${{ vars.CODEREVIEW_AGENT_REF }}
+        run: |
+          if [ -z "$AGENT_REPO" ]; then
+            echo "::error::CODEREVIEW_AGENT_REPO must be set to owner/agent-repo"
+            exit 1
+          fi
+          if ! printf '%s' "$AGENT_REF" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::CODEREVIEW_AGENT_REF must be a full 40-character commit SHA; got '$AGENT_REF'"
+            exit 1
+          fi
+
       - name: Checkout agent
         if: env.SAME_REPO == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ${{ vars.CODEREVIEW_AGENT_REPO || 'OWNER/codereview-agent' }}
-          ref: ${{ vars.CODEREVIEW_AGENT_REF || 'main' }}
+          repository: ${{ vars.CODEREVIEW_AGENT_REPO }}
+          ref: ${{ vars.CODEREVIEW_AGENT_REF }}
           path: .codereview
 
       - name: Set up Python
@@ -113,9 +129,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           # Adjust these paths to your agent's state files.
+          # Only the SQLite cache is shared across PRs. history.jsonl is not
+          # persisted: it is fed into future prompts and is the easiest
+          # cross-PR prompt-injection vector.
           path: |
             data/codereview.db*
-            data/history.jsonl
           key: codereview-state-${{ github.repository }}-review-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             codereview-state-${{ github.repository }}-review-
@@ -146,7 +164,9 @@ jobs:
           # diff is small enough to review without retrieval.
           REVIEW_CONTEXT_ENABLED: "false"
           REVIEW_DEPENDENCY_ENABLED: "true"
-          REVIEW_HISTORY_ENABLED: "true"
+          # History is prompt input from previous PRs; disable it so a
+          # same-repo PR cannot poison later reviews through the shared cache.
+          REVIEW_HISTORY_ENABLED: "false"
           REVIEW_POST_EMPTY_SUMMARY: "true"
           REVIEW_POST_ON_PARTIAL: "false"
           # Keep the whole repository baseline diff in one chunk.
@@ -155,13 +175,11 @@ jobs:
           REVIEW_POLICY_PATH: ".codereview/policies/security.json"
           REVIEW_PROMPT_DIR: ".codereview/prompts"
           DATABASE_PATH: "data/codereview.db"
-          REVIEW_HISTORY_PATH: "data/history.jsonl"
           CHROMA_PATH: "data/chroma"
           CACHE_DIR: "data/cache"
           REVIEW_AUDIT_PATH: "data/audit.jsonl"
         run: |
           mkdir -p data
-          touch data/history.jsonl
           # Keep --post fail-loud: non-zero exit when no review was posted.
           python -I -X utf8 -m codereview.cli \
             --repo "$REPO" \
@@ -177,7 +195,6 @@ jobs:
         with:
           path: |
             data/codereview.db*
-            data/history.jsonl
           key: codereview-state-${{ github.repository }}-review-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload review state
@@ -187,6 +204,5 @@ jobs:
           name: codereview-state-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             data/codereview.db*
-            data/history.jsonl
           if-no-files-found: ignore
           retention-days: 3

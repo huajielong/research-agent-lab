@@ -58,26 +58,51 @@
 
 ## 环境变量
 
-应用启动时**只读取 `DATABASE_URL`**。
+应用读取 `DATABASE_URL` 以及下面的运行配置。
 
-* 容器入口脚本会为本地开发设置一个合理的默认值：
+* 容器入口脚本会用 `POSTGRES_*` 生成 DSN：
 
   ```
-  postgresql://app:local@127.0.0.1:5432/appdb
+  postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@127.0.0.1:5432/<POSTGRES_DB>
   ```
-* 如需使用 Tavily：
+* **`POSTGRES_PASSWORD` 必须显式设置**；入口脚本不再使用默认口令。先
+  `cp .env.example .env`，再把 `POSTGRES_PASSWORD` 改成你自己的值。
+* 如需使用 Tavily：提供 `TAVILY_API_KEY`（通过 `.env` 或 `-e` 传入）。
 
-  * 提供 `TAVILY_API_KEY`（通过 `.env` 或 `-e` 传入）。
-
-可选（如果你想覆盖入口脚本设置的默认值）：
+数据库相关：
 
 * `POSTGRES_USER`（默认 `app`）
-* `POSTGRES_PASSWORD`（默认 `local`）
+* `POSTGRES_PASSWORD`（**必填**）
 * `POSTGRES_DB`（默认 `appdb`）
+* `DATABASE_URL`（可选；不设置时入口脚本自动生成；本地非 Docker 可设为
+  `sqlite:///...`）
+
+运行安全配置（可选）：
+
+* `APP_API_KEY`：设置后 `/generate_report`、`/task_progress`、`/task_status`
+  需要 `X-API-Key` 请求头。
+* `MAX_PROMPT_CHARS`（默认 `4000`）
+* `RATE_LIMIT_PER_MINUTE`（默认 `5`，每个客户端 IP）
+* `MAX_ACTIVE_TASKS`（默认 `10`，运行中 + 排队任务上限）
+* `MAX_CONCURRENT_TASKS`（默认 `2`，同时调用 LLM 的任务数）
+* `CORS_ALLOW_ORIGINS`（逗号分隔；留空 = 只允许同源）
+
+模型相关：
+
 * `OPENAI_MODEL`（默认 `gpt-4.1-mini`，代码会自动补 `openai:` 前缀）
 * `OPENAI_BASE_URL`（OpenAI 兼容端点，例如 DeepSeek）
 * `OPENAI_MAX_TOKENS`（writer 单次输出上限，默认 `32000`；被截断会自动续写）
 * `RESET_DB_ON_STARTUP=1`（启动时清空 `tasks` 表；默认保留历史任务）
+
+---
+
+## 安全说明
+
+* `.env` 同时被 `.gitignore` 和 `.dockerignore` 忽略，`docker build` 不会把本地密钥打进镜像。
+* 生产/公网部署请设置 `APP_API_KEY`；否则任何能访问服务的人都能消耗你的 LLM/Tavily 额度。
+* 接口有每 IP 每分钟限流、提示词长度上限、活动任务上限和并发 LLM 上限；这些按单进程计数，
+  多 worker 部署需在反向代理层再加限流。
+* 前端用 DOMPurify 净化 `marked` 输出；后端对用户 prompt 和 agent 输出做 HTML 转义。
 
 ---
 
@@ -102,7 +127,7 @@ docker run --rm -it  -p 8000:8000  -p 5432:5432  --name fpsvc  --env-file .env  
 ✅ Postgres is ready
 CREATE ROLE
 CREATE DATABASE
-🔗 DATABASE_URL=postgresql://app:local@127.0.0.1:5432/appdb
+🔗 DATABASE_URL set (host=127.0.0.1, port=5432, db=appdb); password redacted
 INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
@@ -115,25 +140,28 @@ INFO:     Uvicorn running on http://0.0.0.0:8000
 
 ## API 快速上手
 
+如果设置了 `APP_API_KEY`，所有任务接口都需要加 `-H "X-API-Key: <你的 key>"`。
+
 ### 发起一次任务
 
 ```bash
 curl -X POST http://localhost:8000/generate_report \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Large Language Models for scientific discovery", "model":"openai:gpt-4o"}'
+  -H "X-API-Key: $APP_API_KEY" \
+  -d '{"prompt": "Large Language Models for scientific discovery"}'
 # -> {"task_id": "UUID..."}
 ```
 
 ### 轮询进度
 
 ```bash
-curl http://localhost:8000/task_progress/<TASK_ID>
+curl -H "X-API-Key: $APP_API_KEY" http://localhost:8000/task_progress/<TASK_ID>
 ```
 
 ### 获取最终状态与报告
 
 ```bash
-curl http://localhost:8000/task_status/<TASK_ID>
+curl -H "X-API-Key: $APP_API_KEY" http://localhost:8000/task_status/<TASK_ID>
 ```
 
 ---
@@ -155,16 +183,14 @@ curl http://localhost:8000/task_status/<TASK_ID>
 
 **容器启动时要求输入 Postgres 密码**
 
-* 入口脚本对管理类操作使用的是 **UNIX socket + peer 认证**（无需密码）。
-  请确认脚本中没有调用 `psql -h 127.0.0.1 -U postgres`，而应使用：
-
-  ```bash
-  su -s /bin/bash postgres -c "psql -c '...'"
-  ```
+* 入口脚本以 postgres 用户执行管理类操作（`runuser -u postgres -- psql ...`，
+  或 `su -s /bin/bash postgres -c 'exec "$@"' _ psql ...`），走
+  **UNIX socket + peer 认证**，不需要 postgres 超级用户密码。
+* 应用角色的密码来自 `POSTGRES_PASSWORD`；未设置时容器会直接报错退出。
 
 **报 `DATABASE_URL not set` 错误**
 
-* 入口脚本会导出一个默认的 DSN。如果你覆盖了它，请确保格式合法：
+* 入口脚本会用 `POSTGRES_*` 生成 DSN；如果你覆盖了它，请确保格式合法：
 
   ```
   postgresql://<user>:<password>@<host>:<port>/<database>
@@ -210,7 +236,8 @@ TAVILY_API_KEY=your-tavily-api-key
 * **从宿主机连接数据库：**
 
   ```bash
-  psql "postgresql://app:local@localhost:5432/appdb"
+  psql "postgresql://app:change-me@localhost:5432/appdb"
+  # 把 change-me 换成你在 .env 里设置的 POSTGRES_PASSWORD
   ```
 
 ---
