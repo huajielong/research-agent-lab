@@ -1,10 +1,13 @@
 from typing import List, Dict
+import ipaddress
+import socket
 import requests
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional
 import os, re, tempfile
 import requests
 from pdfminer.high_level import extract_text
+from urllib.parse import urljoin, urlparse
 
 session = requests.Session()
 session.headers.update(
@@ -99,10 +102,65 @@ def clean_text(s: str) -> str:
     return s.strip()
 
 
+MAX_PDF_BYTES = 50 * 1024 * 1024
+
+
+def _is_public_http_url(url: str) -> bool:
+    """只允许 http(s) + 公网地址，阻止 file://、localhost、内网和元数据地址。
+
+    这是 best-effort：DNS 解析与真正连接之间仍有 rebinding 窗口。
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            return False
+        if not address.is_global:
+            return False
+    return True
+
+
+def _get_public_response(pdf_url: str, timeout: int) -> requests.Response:
+    """手动跟随重定向，每一跳都校验目标地址。"""
+    url = pdf_url
+    for _ in range(5):
+        if not _is_public_http_url(url):
+            raise ValueError("PDF URL is not an allowed public http(s) URL")
+        response = session.get(url, timeout=timeout, allow_redirects=False, stream=True)
+        if response.is_redirect:
+            location = response.headers.get("location")
+            response.close()
+            if not location:
+                raise ValueError("PDF redirect is missing a Location header")
+            url = urljoin(url, location)
+            continue
+        return response
+    raise ValueError("PDF URL redirected too many times")
+
+
 def fetch_pdf_bytes(pdf_url: str, timeout: int = 90) -> bytes:
-    r = session.get(pdf_url, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r.content
+    response = _get_public_response(pdf_url, timeout)
+    try:
+        response.raise_for_status()
+        if not _is_public_http_url(response.url):
+            raise ValueError("PDF redirect target is not an allowed public http(s) URL")
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            content.extend(chunk)
+            if len(content) > MAX_PDF_BYTES:
+                raise ValueError("PDF exceeds the size limit")
+        return bytes(content)
+    finally:
+        response.close()
 
 
 def pdf_bytes_to_text(pdf_bytes: bytes, max_pages: Optional[int] = None) -> str:
