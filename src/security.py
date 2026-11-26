@@ -32,9 +32,9 @@ rate_lock = threading.Lock()
 
 
 def check_rate(request, prefix, limit):
+    # Only the ASGI server may normalize proxy headers after verifying its peer.
+    # Never re-read X-Forwarded-For here (including legacy TRUST_PROXY_HEADERS=1).
     host = request.client.host if request.client else 'unknown'
-    if os.getenv('TRUST_PROXY_HEADERS') == '1':
-        host = request.headers.get('X-Forwarded-For', host).split(',')[-1].strip()
     try:
         address = ipaddress.ip_address(host)
         host = str(ipaddress.ip_network(f'{address}/64', strict=False)) if address.version == 6 else str(address)

@@ -2,6 +2,8 @@ import os
 import uuid
 import json
 import threading
+import copy
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from src.console import configure_console
@@ -21,7 +23,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
 from src.security import (authorize, ALLOW_ANONYMOUS, MAX_PROMPT_CHARS,
-                          MAX_ACTIVE_TASKS, task_semaphore, sanitize_html, safe_result)
+                          MAX_ACTIVE_TASKS, task_semaphore, sanitize_html, safe_result, env_int)
 # Load model configuration before importing the clients and their default arguments.
 from src.planning_agent import planner_agent, executor_agent_step
 
@@ -60,6 +62,9 @@ app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 templates = Jinja2Templates(directory=ROOT / 'templates')
 task_progress = {}
 task_lock = threading.RLock()
+progress_lock = threading.RLock()
+completed_progress = OrderedDict()
+MAX_PROGRESS_ENTRIES = env_int('MAX_PROGRESS_ENTRIES', 200)
 
 
 @app.middleware('http')
@@ -137,13 +142,17 @@ def delete_finished_tasks(task_ids):
         for task in tasks:
             db.delete(task)
         db.commit()
-    for task_id in ids:
-        task_progress.pop(task_id, None)
+    with progress_lock:
+        for task_id in ids:
+            task_progress.pop(task_id, None)
+            completed_progress.pop(task_id, None)
     return ids
 
 
 def save_progress(task_id, status='running', report=None, error=None):
-    result = {'history': safe_result(task_progress[task_id]['steps'])}
+    with progress_lock:
+        steps = copy.deepcopy(task_progress[task_id]['steps'])
+    result = {'history': safe_result(steps)}
     if report is not None:
         result['html_report'] = sanitize_html(report)
     if error:
@@ -154,6 +163,20 @@ def save_progress(task_id, status='running', report=None, error=None):
         task.result = json.dumps(result, ensure_ascii=False)
         task.updated_at = datetime.utcnow()
         db.commit()
+    if status in ('done', 'error'):
+        cache_completed_progress(task_id)
+
+
+def cache_completed_progress(task_id):
+    """Evict only persisted, finished entries; active tasks have their own cap."""
+    with progress_lock:
+        if task_id not in task_progress:
+            return
+        completed_progress.pop(task_id, None)
+        completed_progress[task_id] = None
+        while len(completed_progress) > MAX_PROGRESS_ENTRIES:
+            oldest, _ = completed_progress.popitem(last=False)
+            task_progress.pop(oldest, None)
 
 
 @app.post('/generate_report')
@@ -171,7 +194,8 @@ def start_report(req):
     with SessionLocal() as db:
         db.add(Task(id=task_id, prompt=req.prompt, status='running'))
         db.commit()
-    task_progress[task_id] = {'steps': []}
+    with progress_lock:
+        task_progress[task_id] = {'steps': []}
     threading.Thread(target=plan_and_run, args=(task_id, req.prompt), daemon=True).start()
     return {'task_id': task_id}
 
@@ -186,10 +210,11 @@ def _plan_and_run(task_id, prompt):
         plan = planner_agent(prompt)
         if not plan:
             raise ValueError('未能生成有效研究计划，请重试。')
-        task_progress[task_id]['steps'] = [
-            {'title': title, 'status': 'pending', 'description': '等待执行', 'substeps': []}
-            for title in plan
-        ]
+        with progress_lock:
+            task_progress[task_id]['steps'] = [
+                {'title': title, 'status': 'pending', 'description': '等待执行', 'substeps': []}
+                for title in plan
+            ]
         save_progress(task_id)
         run_agent_workflow(task_id, prompt, plan)
     except Exception as exc:
@@ -199,8 +224,10 @@ def _plan_and_run(task_id, prompt):
 
 @app.get('/task_progress/{task_id}')
 def get_task_progress(task_id: str):
-    if task_id in task_progress:
-        return safe_result(task_progress[task_id])
+    with progress_lock:
+        cached = copy.deepcopy(task_progress.get(task_id))
+    if cached is not None:
+        return safe_result(cached)
     with SessionLocal() as db:
         task = db.get(Task, task_id)
         if not task:
@@ -225,19 +252,23 @@ def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
     try:
         for index, title in enumerate(initial_plan_steps):
             step = steps[index]
-            step.update(status='running', description='正在执行：' + title)
+            with progress_lock:
+                step.update(status='running', description='正在执行：' + title)
             save_progress(task_id)
             description, agent, output = executor_agent_step(title, history, prompt)
             if output.startswith('[模型错误：'):
                 raise RuntimeError(output)
             history.append([title, description, output])
-            step.update(status='done', description='已完成：' + title)
-            step['substeps'].append({'title': '调用 ' + agent, 'content': sanitize_html(output)})
+            content = sanitize_html(output)
+            with progress_lock:
+                step.update(status='done', description='已完成：' + title)
+                step['substeps'].append({'title': '调用 ' + agent, 'content': content})
             save_progress(task_id)
         save_progress(task_id, status='done', report=history[-1][-1] if history else '未生成报告。')
     except Exception as exc:
         print('研究执行失败：', task_id, type(exc).__name__)
-        for step in steps:
-            if step['status'] == 'running':
-                step.update(status='error', description=WORKFLOW_ERROR)
+        with progress_lock:
+            for step in steps:
+                if step['status'] == 'running':
+                    step.update(status='error', description=WORKFLOW_ERROR)
         save_progress(task_id, status='error', error=WORKFLOW_ERROR)

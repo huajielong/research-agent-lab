@@ -1,7 +1,11 @@
 # Never copy local secrets into the image layer.
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
+*.bak
+**/*.bak
 
 # VCS / caches / local state
 .git

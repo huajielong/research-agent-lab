@@ -30,6 +30,7 @@ class ApiTests(unittest.TestCase):
         self.client.__enter__()
         self.addCleanup(self.client.__exit__, None, None, None)
         main.task_progress.clear()
+        main.completed_progress.clear()
         from src.security import rate_events
         rate_events.clear()
         with main.SessionLocal() as db:
@@ -187,6 +188,55 @@ class ApiTests(unittest.TestCase):
         with patch.object(main, 'MAX_ACTIVE_TASKS', 1), patch.object(main.threading, 'Thread') as thread:
             self.assertEqual(self.client.post('/generate_report', json={'prompt': 'Overflow'}).status_code, 429)
             thread.assert_not_called()
+
+    def test_completed_progress_cache_is_bounded_without_losing_history(self):
+        # Keep one active task while several completed tasks pass through the cache.
+        with patch.dict(os.environ, {'RATE_LIMIT_PER_MINUTE': '100'}), \
+             patch.object(main, 'MAX_PROGRESS_ENTRIES', 2, create=True):
+            with patch.object(main.threading, 'Thread'):
+                active = self.client.post('/generate_report', json={'prompt': 'Still active'}).json()['task_id']
+            completed = []
+            for index in range(5):
+                with patch.object(main.threading, 'Thread'):
+                    task_id = self.client.post('/generate_report', json={'prompt': f'Cached {index}'}).json()['task_id']
+                main.plan_and_run(task_id, f'Cached {index}')
+                completed.append(task_id)
+            self.assertIn(active, main.task_progress)
+            self.assertLessEqual(len(main.task_progress), 3)
+            self.assertNotIn(completed[0], main.task_progress)
+            self.assertIn(completed[-1], main.task_progress)
+            self.assertEqual(self.client.get('/task_status/' + completed[0]).json()['status'], 'done')
+            self.assertEqual(self.client.get('/task_progress/' + completed[0]).json()['steps'][-1]['status'], 'done')
+            self.assertEqual(len(self.client.get('/tasks').json()['tasks']), 6)
+
+    def test_failed_progress_cache_is_also_bounded(self):
+        with patch.object(main, 'MAX_PROGRESS_ENTRIES', 1, create=True):
+            failed = []
+            for index in range(3):
+                with patch.object(main.threading, 'Thread'):
+                    task_id = self.client.post('/generate_report', json={'prompt': f'Failure {index}'}).json()['task_id']
+                with patch.object(main, 'planner_agent', side_effect=RuntimeError('Test failure')):
+                    main.plan_and_run(task_id, 'Failure')
+                failed.append(task_id)
+            self.assertLessEqual(len(main.task_progress), 1)
+            self.assertEqual(self.client.get('/task_status/' + failed[0]).json()['status'], 'error')
+
+    def test_spoofed_forwarded_headers_cannot_bypass_auth_throttle(self):
+        with patch.dict(os.environ, {'TRUST_PROXY_HEADERS': '1', 'AUTH_FAILURE_LIMIT': '2'}):
+            codes = [self.client.get('/tasks', headers={'X-API-Key': 'wrong', 'X-Forwarded-For': f'198.51.100.{i}'}).status_code for i in range(3)]
+        self.assertEqual(codes, [401, 401, 429])
+
+    def test_server_proxy_validation_preserves_real_client_limits(self):
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+        wrapped = ProxyHeadersMiddleware(main.app, trusted_hosts=['10.0.0.5'])
+        with TestClient(wrapped, client=('198.51.100.9', 12345), headers={'X-API-Key': 'test-workspace-secret'}) as direct, \
+             TestClient(wrapped, client=('10.0.0.5', 12345), headers={'X-API-Key': 'test-workspace-secret'}) as proxy, \
+             patch.dict(os.environ, {'TRUST_PROXY_HEADERS': '1', 'POLL_RATE_LIMIT_PER_MINUTE': '1'}):
+            self.assertEqual(direct.get('/tasks', headers={'X-Forwarded-For': '203.0.113.1'}).status_code, 200)
+            self.assertEqual(direct.get('/tasks', headers={'X-Forwarded-For': '203.0.113.2'}).status_code, 429)
+            self.assertEqual(proxy.get('/tasks', headers={'X-Forwarded-For': '203.0.113.1'}).status_code, 200)
+            self.assertEqual(proxy.get('/tasks', headers={'X-Forwarded-For': '203.0.113.2'}).status_code, 200)
+            self.assertEqual(proxy.get('/tasks', headers={'X-Forwarded-For': '203.0.113.1'}).status_code, 429)
 
     def test_legacy_and_new_model_html_is_sanitized(self):
         import json

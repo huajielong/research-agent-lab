@@ -97,4 +97,10 @@ docker run --rm -p 8000:8000 --env-file .env research-workspace
 
 当前工作流适合单进程本地使用；不支持跨进程任务调度、任务取消或服务重启后继续模型调用。
 
+已结束任务的内存进度缓存最多保留 `MAX_PROGRESS_ENTRIES` 条（默认 200），成功和失败均按结束顺序淘汰；运行/排队任务另受 `MAX_ACTIVE_TASKS` 限制，不会因缓存淘汰而中断。数据库历史不会被删除，淘汰后查询自动回退到数据库。
+
+限流只使用 ASGI 提供的客户端地址，应用不再读取 `X-Forwarded-For`，旧 `TRUST_PROXY_HEADERS` 开关不再生效。部署反向代理时由 Uvicorn 校验实际连接来源，例如 `uvicorn main:app --proxy-headers --forwarded-allow-ips=10.0.0.5`，将示例地址替换为实际可信代理；不要配置通配符 `*`。Docker 环境可给 Uvicorn 设置 `FORWARDED_ALLOW_IPS`，没有代理时使用默认设置即可。
+
+Docker 构建上下文排除根目录及子目录的 `.env`、`.env.*` 和 `*.bak`，只保留根目录的 `.env.example` 配置模板。
+
 模型及搜索服务失败时，页面和 API 仅返回固定提示，不返回上游异常详情；旧记录中的异常详情也会在读取时隐藏。服务端日志只记录任务编号及异常类型。Wikipedia 工具使用 HTTPS 和描述性 User-Agent。
