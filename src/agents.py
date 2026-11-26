@@ -1,5 +1,6 @@
 import os
 from src.console import configure_console
+from src.errors import MODEL_ERROR
 
 configure_console()
 from datetime import datetime
@@ -160,8 +161,8 @@ USER RESEARCH REQUEST:
         return content, messages
 
     except Exception as e:
-        print("❌ 错误：", e)
-        return f"[模型错误：{str(e)}]", messages
+        print("❌ 模型调用失败：", type(e).__name__)
+        return MODEL_ERROR, messages
 
 
 def writer_agent(

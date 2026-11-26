@@ -41,3 +41,28 @@ test('API helper sends workspace key without putting it in URL',async()=>{
   assert.equal(new Headers(request?.options.headers).get('X-API-Key'),'unit-test-key');
   assert.ok(!request.path.includes('unit-test-key'));
 });
+
+test('raw marked HTML always passes through sanitizer including style restrictions',()=>{
+  const {context}=client();
+  const marked=require('../static/vendor/marked.min.js');
+  const payload='<p style="position:fixed!important;z-index:999999">Finding</p><img src=x onerror="alert(1)">';
+  const calls=[];
+  const purifier={sanitize(html,options){calls.push({html,options});return '<p>Finding</p>';}};
+  context.marked=context.window.marked=marked;
+  context.DOMPurify=context.window.DOMPurify=purifier;
+  const result=vm.runInContext(`safeMarkdown(${JSON.stringify(payload)})`,context);
+  assert.equal(result,'<p>Finding</p>');
+  assert.equal(calls.length,1);
+  assert.ok(calls[0].html.includes('onerror'));
+  assert.ok(calls[0].options.FORBID_ATTR.includes('style'));
+  assert.ok(calls[0].options.FORBID_TAGS.includes('style'));
+});
+
+test('missing sanitizer falls back to escaped text instead of raw marked output',()=>{
+  const {context}=client();
+  context.window.marked=context.marked=require('../static/vendor/marked.min.js');
+  const html=vm.runInContext(`safeMarkdown('<img src=x onerror="alert(1)"><style>body{display:none}</style>')`,context);
+  assert.ok(!html.includes('<img'));
+  assert.ok(!html.includes('<style'));
+  assert.ok(html.includes('&lt;img'));
+});

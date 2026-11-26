@@ -60,7 +60,43 @@ class ApiTests(unittest.TestCase):
             main.plan_and_run(task_id, 'Fail')
         task = self.client.get('/task_status/' + task_id).json()
         self.assertEqual(task['status'], 'error')
-        self.assertIn('Provider unavailable', task['result']['error'])
+        self.assertNotIn('Provider unavailable', str(task))
+        self.assertIn('暂时不可用', task['result']['error'])
+
+    def test_execution_errors_are_generic_in_storage_progress_and_status(self):
+        secret = 'provider endpoint=https://internal.invalid request=private-test-token'
+        for failing_output in (False, True):
+            with self.subTest(failing_output=failing_output), patch.object(main.threading, 'Thread'):
+                task_id = self.client.post('/generate_report', json={'prompt': 'Failure test'}).json()['task_id']
+            behavior = {'return_value': ('description', 'research', '[模型错误：' + secret + ']')} if failing_output else {'side_effect': RuntimeError(secret)}
+            with patch.object(main, 'executor_agent_step', **behavior):
+                main.plan_and_run(task_id, 'Failure test')
+            for path in ('/task_status/' + task_id, '/task_progress/' + task_id):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn('private-test-token', response.text)
+                self.assertNotIn('internal.invalid', response.text)
+                self.assertIn('暂时不可用', response.text)
+            with main.SessionLocal() as db:
+                self.assertNotIn('private-test-token', db.get(main.Task, task_id).result)
+
+    def test_legacy_error_details_are_not_returned(self):
+        import json
+        secret = 'old-provider-private-token'
+        with main.SessionLocal() as db:
+            db.add(main.Task(id='legacy-error', prompt='Old', status='error', result=json.dumps({
+                'error': secret, 'history': [{'status': 'error', 'description': secret}]})))
+            db.commit()
+        for path in ('/task_status/legacy-error', '/task_progress/legacy-error'):
+            self.assertNotIn(secret, self.client.get(path).text)
+
+    def test_model_styles_are_removed_before_reaching_clients(self):
+        from src.security import sanitize_html
+        payload = '<style>body{display:none}</style><p style="position:fixed!important;z-index:999999;background:url(https://example.com/track)">Finding</p>'
+        cleaned = sanitize_html(payload)
+        self.assertNotIn('<style', cleaned)
+        self.assertNotIn('style=', cleaned)
+        self.assertIn('<p>Finding</p>', cleaned)
 
     def test_unknown_task_and_config(self):
         self.assertEqual(self.client.get('/task_progress/missing').status_code, 404)

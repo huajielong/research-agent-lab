@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from src.console import configure_console
+from src.errors import WORKFLOW_ERROR, RESTART_ERROR, public_error
 
 configure_console()
 
@@ -49,7 +50,7 @@ Base.metadata.create_all(bind=engine)
 with SessionLocal() as db:
     for task in db.query(Task).filter(Task.status == 'running').all():
         result = json.loads(task.result) if task.result else {}
-        result['error'] = '服务已重启，此次研究已中断。可以根据原问题重新发起研究。'
+        result['error'] = RESTART_ERROR
         task.result = json.dumps(result, ensure_ascii=False)
         task.status = 'error'
     db.commit()
@@ -146,7 +147,7 @@ def save_progress(task_id, status='running', report=None, error=None):
     if report is not None:
         result['html_report'] = sanitize_html(report)
     if error:
-        result['error'] = error
+        result['error'] = public_error(error)
     with SessionLocal() as db:
         task = db.get(Task, task_id)
         task.status = status
@@ -192,7 +193,8 @@ def _plan_and_run(task_id, prompt):
         save_progress(task_id)
         run_agent_workflow(task_id, prompt, plan)
     except Exception as exc:
-        save_progress(task_id, status='error', error=str(exc))
+        print('研究规划失败：', task_id, type(exc).__name__)
+        save_progress(task_id, status='error', error=WORKFLOW_ERROR)
 
 
 @app.get('/task_progress/{task_id}')
@@ -234,7 +236,8 @@ def run_agent_workflow(task_id: str, prompt: str, initial_plan_steps: list):
             save_progress(task_id)
         save_progress(task_id, status='done', report=history[-1][-1] if history else '未生成报告。')
     except Exception as exc:
+        print('研究执行失败：', task_id, type(exc).__name__)
         for step in steps:
             if step['status'] == 'running':
-                step.update(status='error', description=str(exc))
-        save_progress(task_id, status='error', error=str(exc))
+                step.update(status='error', description=WORKFLOW_ERROR)
+        save_progress(task_id, status='error', error=WORKFLOW_ERROR)

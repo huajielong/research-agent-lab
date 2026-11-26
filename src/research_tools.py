@@ -295,7 +295,7 @@ def arxiv_search_tool(
         resp = session.get(api_url, timeout=60)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        return [{"error": f"arXiv API 请求失败：{e}"}]
+        return [{"error": "arXiv 搜索暂时不可用，请稍后重试。"}]
 
     try:
         root = ET.fromstring(resp.content)
@@ -343,7 +343,7 @@ def arxiv_search_tool(
                     pdf_bytes = fetch_pdf_bytes(link_pdf, timeout=90)
                     time.sleep(_SLEEP_SECONDS)
                 except Exception as e:
-                    item["pdf_error"] = f"PDF 下载失败：{e}"
+                    item["pdf_error"] = "PDF 下载失败，请稍后重试。"
 
             if _EXTRACT_TEXT and pdf_bytes:
                 try:
@@ -355,14 +355,14 @@ def arxiv_search_tool(
                         else:
                             item["summary"] = text[:_TEXT_CHARS]
                 except Exception as e:
-                    item["text_error"] = f"文本抽取失败：{e}"
+                    item["text_error"] = "PDF 文本抽取失败。"
 
             out.append(item)
         return out
     except ET.ParseError as e:
-        return [{"error": f"arXiv API XML 解析失败：{e}"}]
+        return [{"error": "arXiv 返回了无法解析的结果，请稍后重试。"}]
     except Exception as e:
-        return [{"error": f"未预期的错误：{e}"}]
+        return [{"error": "arXiv 搜索暂时不可用，请稍后重试。"}]
 
 
 # ---- 工具定义 ----
@@ -411,9 +411,8 @@ def tavily_search_tool(
     if not api_key:
         raise ValueError("环境变量中未找到 TAVILY_API_KEY。")
 
-    client = TavilyClient(api_key, api_base_url=os.getenv("DLAI_TAVILY_BASE_URL"))
-
     try:
+        client = TavilyClient(api_key, api_base_url=os.getenv("DLAI_TAVILY_BASE_URL"))
         response = client.search(
             query=query, max_results=max_results, include_images=include_images
         )
@@ -435,7 +434,7 @@ def tavily_search_tool(
         return results
 
     except Exception as e:
-        return [{"error": str(e)}]  # 便于 LLM 智能体解析
+        return [{"error": "Tavily 搜索暂时不可用，请稍后重试。"}]
 
 
 tavily_tool_def = {
@@ -470,6 +469,11 @@ tavily_tool_def = {
 
 from typing import List, Dict
 import wikipedia
+import wikipedia.wikipedia as _wikipedia
+
+# The package's public API_URL is only a copy; requests use the submodule global.
+_wikipedia.API_URL = 'https://en.wikipedia.org/w/api.php'
+_wikipedia.USER_AGENT = 'research-agent-lab/1.0 (local educational use)'
 
 
 def wikipedia_search_tool(query: str, sentences: int = 5) -> List[Dict]:
@@ -490,7 +494,7 @@ def wikipedia_search_tool(query: str, sentences: int = 5) -> List[Dict]:
 
         return [{"title": page.title, "summary": summary, "url": page.url}]
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": "Wikipedia 搜索暂时不可用，请稍后重试。"}]
 
 
 # 工具定义

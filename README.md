@@ -96,3 +96,5 @@ docker run --rm -p 8000:8000 --env-file .env research-workspace
 镜像沿用课程方案，在同一容器运行 PostgreSQL 和 API。启动前必须在 `.env` 设置非空 `POSTGRES_PASSWORD`，没有默认密码；角色及数据库标识符和密码交给 psql 安全引用，DSN 做 URL 编码且不会写入日志。数据库需要持久化时应配置卷或外部 PostgreSQL。`RESET_DB_ON_STARTUP=1` 会清空任务表，日常使用无需设置。
 
 当前工作流适合单进程本地使用；不支持跨进程任务调度、任务取消或服务重启后继续模型调用。
+
+模型及搜索服务失败时，页面和 API 仅返回固定提示，不返回上游异常详情；旧记录中的异常详情也会在读取时隐藏。服务端日志只记录任务编号及异常类型。Wikipedia 工具使用 HTTPS 和描述性 User-Agent。

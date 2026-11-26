@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 import bleach
 from fastapi import HTTPException
 from markdown_it import MarkdownIt
+from src.errors import WORKFLOW_ERROR, public_error
 
 
 def env_int(name, default):
@@ -84,8 +85,13 @@ def safe_result(value):
     """Also protect reports persisted by older versions; text fields remain text."""
     value = copy.deepcopy(value)
     if isinstance(value, dict):
+        if value.get('status') == 'error' and 'description' in value:
+            value['description'] = WORKFLOW_ERROR
         for key, item in value.items():
-            value[key] = sanitize_html(item) if key in ('html_report', 'content') and isinstance(item, str) else safe_result(item)
+            if key == 'error' and isinstance(item, str):
+                value[key] = public_error(item)
+            else:
+                value[key] = sanitize_html(item) if key in ('html_report', 'content') and isinstance(item, str) else safe_result(item)
     elif isinstance(value, list):
         value = [safe_result(item) for item in value]
     return value
