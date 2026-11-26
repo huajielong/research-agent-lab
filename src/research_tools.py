@@ -1,13 +1,13 @@
-from typing import List, Dict
 import ipaddress
 import socket
+from urllib.parse import urljoin, urlparse
+from typing import List, Dict
 import requests
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional
 import os, re, tempfile
 import requests
 from pdfminer.high_level import extract_text
-from urllib.parse import urljoin, urlparse
 
 session = requests.Session()
 session.headers.update(
@@ -110,11 +110,17 @@ ALLOWED_PDF_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
 
 
 def _is_allowed_pdf_url(url: str) -> bool:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host not in ALLOWED_PDF_HOSTS and not host.endswith(".arxiv.org"):
+    if not isinstance(url, str) or any(ord(c) < 33 or ord(c) == 127 for c in url) or "\\" in url:
         return False
-    return _is_public_http_url(url)
+    try:
+        parsed = urlparse(url)
+        if parsed.hostname not in ALLOWED_PDF_HOSTS or parsed.username is not None or parsed.password is not None:
+            return False
+        if parsed.scheme not in ("http", "https") or parsed.port not in (None, 443 if parsed.scheme == "https" else 80):
+            return False
+        return _is_public_http_url(url)
+    except ValueError:
+        return False
 
 
 def _is_public_http_url(url: str) -> bool:
@@ -128,6 +134,8 @@ def _is_public_http_url(url: str) -> bool:
     try:
         infos = socket.getaddrinfo(parsed.hostname, None)
     except OSError:
+        return False
+    if not infos:
         return False
     for info in infos:
         try:
@@ -176,6 +184,9 @@ def _get_public_response(pdf_url: str, timeout: int) -> requests.Response:
         response = session.get(url, timeout=timeout, allow_redirects=False, stream=True)
         if not _uses_proxy(url):
             peer = _connected_peer_ip(response)
+            if peer is None:
+                response.close()
+                raise ValueError("Cannot verify PDF connected peer")
             if peer is not None:
                 try:
                     peer_ip = ipaddress.ip_address(peer.split("%", 1)[0])
@@ -284,7 +295,7 @@ def arxiv_search_tool(
         resp = session.get(api_url, timeout=60)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        return [{"error": f"arXiv API 请求失败：{e}"}]
+        return [{"error": "arXiv 搜索暂时不可用，请稍后重试。"}]
 
     try:
         root = ET.fromstring(resp.content)
@@ -332,7 +343,7 @@ def arxiv_search_tool(
                     pdf_bytes = fetch_pdf_bytes(link_pdf, timeout=90)
                     time.sleep(_SLEEP_SECONDS)
                 except Exception as e:
-                    item["pdf_error"] = f"PDF 下载失败：{e}"
+                    item["pdf_error"] = "PDF 下载失败，请稍后重试。"
 
             if _EXTRACT_TEXT and pdf_bytes:
                 try:
@@ -344,14 +355,14 @@ def arxiv_search_tool(
                         else:
                             item["summary"] = text[:_TEXT_CHARS]
                 except Exception as e:
-                    item["text_error"] = f"文本抽取失败：{e}"
+                    item["text_error"] = "PDF 文本抽取失败。"
 
             out.append(item)
         return out
     except ET.ParseError as e:
-        return [{"error": f"arXiv API XML 解析失败：{e}"}]
+        return [{"error": "arXiv 返回了无法解析的结果，请稍后重试。"}]
     except Exception as e:
-        return [{"error": f"未预期的错误：{e}"}]
+        return [{"error": "arXiv 搜索暂时不可用，请稍后重试。"}]
 
 
 # ---- 工具定义 ----
@@ -398,13 +409,10 @@ def tavily_search_tool(
     """
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        # 与其他工具保持一致：返回 error 字典而不是抛异常，
-        # 否则 aisuite 的工具循环会中断整个 research_agent 回合。
-        return [{"error": "环境变量中未找到 TAVILY_API_KEY。"}]
-
-    client = TavilyClient(api_key, api_base_url=os.getenv("DLAI_TAVILY_BASE_URL"))
+        raise ValueError("环境变量中未找到 TAVILY_API_KEY。")
 
     try:
+        client = TavilyClient(api_key, api_base_url=os.getenv("DLAI_TAVILY_BASE_URL"))
         response = client.search(
             query=query, max_results=max_results, include_images=include_images
         )
@@ -426,7 +434,7 @@ def tavily_search_tool(
         return results
 
     except Exception as e:
-        return [{"error": str(e)}]  # 便于 LLM 智能体解析
+        return [{"error": "Tavily 搜索暂时不可用，请稍后重试。"}]
 
 
 tavily_tool_def = {
@@ -463,12 +471,9 @@ from typing import List, Dict
 import wikipedia
 import wikipedia.wikipedia as _wikipedia
 
-# wikipedia 包默认用 http:// 且通用 UA，Wikimedia 会返回 429 纯文本，
-# 包内 r.json() 因此报 "Expecting value: line 1 column 1"。
-# 注意：wikipedia.API_URL 只是 from .wikipedia import * 的副本，
-# 必须改子模块 wikipedia.wikipedia 里的同名全局变量。
-_wikipedia.API_URL = "https://en.wikipedia.org/w/api.php"
-_wikipedia.USER_AGENT = "research-agent-lab/1.0 (local educational use)"
+# The package's public API_URL is only a copy; requests use the submodule global.
+_wikipedia.API_URL = 'https://en.wikipedia.org/w/api.php'
+_wikipedia.USER_AGENT = 'research-agent-lab/1.0 (local educational use)'
 
 
 def wikipedia_search_tool(query: str, sentences: int = 5) -> List[Dict]:
@@ -489,7 +494,7 @@ def wikipedia_search_tool(query: str, sentences: int = 5) -> List[Dict]:
 
         return [{"title": page.title, "summary": summary, "url": page.url}]
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": "Wikipedia 搜索暂时不可用，请稍后重试。"}]
 
 
 # 工具定义

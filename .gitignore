@@ -206,6 +206,14 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# 本 lab 的本地调试产物
+# Local configuration, research data and preview artifacts
+.env.*
+!.env.example
 *.db
+*.db-*
+*.db.*
+*.sqlite*
+*.bak
 .screenshots/
+.tmp/
+docs/design/*.jpg

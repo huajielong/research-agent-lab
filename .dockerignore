@@ -1,7 +1,11 @@
 # Never copy local secrets into the image layer.
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
+*.bak
+**/*.bak
 
 # VCS / caches / local state
 .git
@@ -15,6 +19,12 @@ venv/
 data/
 tasks.db
 tasks.db.*
+*.db
+*.db-*
+*.db.*
+*.sqlite*
+.screenshots/
+docs/design/*.jpg
 *.log
 
 # Agent instructions and docs are not needed at runtime.
